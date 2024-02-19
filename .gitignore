@@ -17,4 +17,5 @@ filelists
 /data
 /protoc-25.3-win64
 /.idea
-/ffmpeg
+ffmpeg.exe
+/.cache

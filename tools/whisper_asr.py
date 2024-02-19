@@ -50,7 +50,7 @@ from fish_speech.utils.file import AUDIO_EXTENSIONS, list_files
 @click.option("--language", default="ZH", help="Language of the transcription")
 def main(model_size, audio_dir, save_dir, sample_rate, device, language):
     logger.info("Loading / Downloading OpenAI Whisper model...")
-    model = whisper.load_model(name=model_size, device=device)
+    model = whisper.load_model(name=model_size, device=device, download_root=str(Path(".cache/whisper").resolve()))
     logger.info("Model loaded.")
 
     save_path = Path(save_dir)
@@ -84,7 +84,7 @@ def main(model_size, audio_dir, save_dir, sample_rate, device, language):
 
             extract = audio[..., int(start * sr) : int(end * sr)]
             audio_save_path = (
-                save_path / rel_path.parent / f"{file_stem}_{id}{file_suffix}"
+                save_path / rel_path.parent / f"{file_stem}-{id}{file_suffix}"
             )
             sf.write(
                 audio_save_path,
@@ -93,7 +93,7 @@ def main(model_size, audio_dir, save_dir, sample_rate, device, language):
             )
             original_files.append(audio_save_path)
 
-            transcript_save_path = save_path / rel_path.parent / f"{file_stem}_{id}.lab"
+            transcript_save_path = save_path / rel_path.parent / f"{file_stem}-{id}.lab"
             with open(
                 transcript_save_path,
                 "w",

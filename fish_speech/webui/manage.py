@@ -243,10 +243,13 @@ def check_files(data_path: str, max_depth: int, label_model: str, label_device: 
         tar_path = data_path / item_path.name
         if content["type"] == "folder" and item_path.is_dir():
             cur_lang = dict_to_language[content["label_lang"]]
-            print(cur_lang)
             if cur_lang != "WTF":
-                subprocess.run([PYTHON, "tools/whisper_asr.py", "--model_size", label_model, "--device", label_device,
-                                "--audio-dir", item_path, "--save-dir", item_path, "--language", cur_lang])
+                try:
+                    subprocess.run([PYTHON, "tools/whisper_asr.py", "--model-size", label_model, "--device", label_device,
+                                    "--audio-dir", item_path, "--save-dir", item_path, "--language", cur_lang],
+                                   env=os.environ.copy())
+                except Exception:
+                    exit()
             if content["method"] == "复制一份":
                 os.makedirs(tar_path, exist_ok=True)
                 shutil.copytree(src=str(item_path), dst=str(tar_path), dirs_exist_ok=True)
@@ -327,7 +330,8 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
         with gr.Column():
             with gr.Tab("\U0001F4D6 数据集准备"):
                 with gr.Row():
-                    textbox = gr.Textbox(label="\U0000270F 输入音频&转写源文件夹路径", interactive=True)
+                    textbox = gr.Textbox(label="\U0000270F 输入音频&转写源文件夹路径",
+                                         info="音频装在一个以说话人命名的文件夹内作为区分", interactive=True)
                     transcript_path = gr.Textbox(label="\U0001F4DD 转写文本filelist所在路径",
                                                  info="支持 Bert-Vits2 / GPT-SoVITS 格式",
                                                  interactive=True)
@@ -340,7 +344,7 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
                     remove_button = gr.Button("\U000026D4 取消所选内容")
 
                 with gr.Row():
-                    label_device = gr.Dropdown(label="打标设备", info="建议使用cuda", choices=["cpu", "cuda"],
+                    label_device = gr.Dropdown(label="打标设备", info="建议使用cuda, 实在是低配置再用cpu", choices=["cpu", "cuda"],
                                                value="cuda", interactive=True)
                     label_model = gr.Dropdown(label="打标模型大小", info="显存10G以上用large, 5G用medium, 2G用small",
                                               choices=["large", "medium", "small"],
@@ -455,7 +459,7 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
                 tree_slider = gr.Slider(minimum=0, maximum=3, value=0, step=1, show_label=False, container=False)
                 file_markdown = new_explorer(str(default_output), 0)
             with gr.Row(equal_height=False):
-                admit_btn = gr.Button("\U00002705 文件预处理", scale=0, min_width=80, variant="primary")
+                admit_btn = gr.Button("\U00002705 文件预处理", scale=0, min_width=160, variant="primary")
                 fresh_btn = gr.Button("\U0001F503", scale=0, min_width=80)
                 help_button = gr.Button("\U00002753", scale=0, min_width=80)  # question
                 train_btn = gr.Button("训练启动!", variant="primary")
