@@ -16,8 +16,9 @@ from torch.distributed import get_rank, get_world_size, is_initialized
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from transformers import AutoTokenizer
 
-from fish_speech.datasets.protos.text_data_pb2 import SampleDataRequest
+from fish_speech.datasets.protos.text_data_pb2 import SampleDataRequest, SampledData
 from fish_speech.datasets.protos.text_data_pb2_grpc import DataServiceStub
+from fish_speech.datasets.protos.text_data_stream import read_pb_stream
 from fish_speech.text.parser import clean_text
 from fish_speech.text.symbols import pad as pad_symbol
 from fish_speech.text.symbols import pu_symbols
@@ -25,6 +26,9 @@ from fish_speech.utils import RankedLogger
 from fish_speech.utils.braceexpand import braceexpand
 
 log = RankedLogger(__name__, rank_zero_only=True)
+
+CODEBOOK_BOS_TOKEN_ID = 0
+CODEBOOK_EOS_TOKEN_ID = 1
 
 
 def split_by_rank_worker(files):
@@ -171,6 +175,12 @@ class AutoAugTextDataset(IterableDataset):
     1. Random concatenate multiple sentences from the same speaker to form a longer sentence
     2. Automatically normalize the text
     3. Mix text and phones
+
+    For interactive mode, we use the following format (multiple sequences):
+    <s> [INST] [SPK: speaker] text [/INST] ... [INST] text [/INST] </s>
+
+    For non-interactive mode, we use the following format (one long sequence):
+    <s> [INST] text [/INST] ... </s>
     """
 
     def __init__(
@@ -179,9 +189,13 @@ class AutoAugTextDataset(IterableDataset):
         seed: int = 42,
         phones_prob: float = 0.3,
         repetition_prob: float = 0.0,
+        interactive_prob: float = 0.5,
         max_length: int = 1024,
         tokenizer: AutoTokenizer = None,
         use_speaker: bool = True,
+        use_data_server: bool = False,
+        proto_files: str = "data",
+        causual: bool = True,
     ):
         """
         Args:
@@ -189,8 +203,13 @@ class AutoAugTextDataset(IterableDataset):
             seed: random seed
             phones_prob: probability to use phones
             repetition_prob: probability to repeat the same sentence
+            interactive_prob: probability to use interactive mode
             max_length: max length of the text
             tokenizer: tokenizer
+            use_speaker: include speaker information in the prompt
+            use_data_server: use data server or local data
+            proto_files: proto buf files if using local data
+            causual: use causual sampling when using local data, disable will lead to random sampling
         """
 
         super().__init__()
@@ -200,11 +219,34 @@ class AutoAugTextDataset(IterableDataset):
         self.max_length = max_length
         self.tokenizer = tokenizer
         self.repetition_prob = repetition_prob
+        self.interactive_prob = interactive_prob
         self.use_speaker = use_speaker
+        self.use_data_server = use_data_server
+        self.proto_files = proto_files
+        self.causual = causual
 
-        # Read all lines, and group by speaker
-        self.channel = grpc.insecure_channel(server)
-        self.stub = DataServiceStub(self.channel)
+        if use_data_server is True:
+            self.channel = grpc.insecure_channel(server)
+            self.stub = DataServiceStub(self.channel)
+        else:
+            self.init_mock_data_server()
+
+    def init_mock_data_server(self):
+        self.groups = []
+        count = 0
+        for filename in self.proto_files:
+            with open(filename, "rb") as f:
+                for text_data in read_pb_stream(f):
+                    self.groups.append(text_data)
+                    count += 1
+
+                    if count % 1000 == 0:
+                        log.info(f"Read {count} groups of data")
+
+        log.info(f"Read total {count} groups of data")
+
+        # Shuffle the lines
+        Random(self.seed).shuffle(self.groups)
 
     def __iter__(self):
         while True:
@@ -231,6 +273,37 @@ class AutoAugTextDataset(IterableDataset):
         )
         return sentence, len(tokens)
 
+    def sample_data(self):
+        # Shuffle unique lines, estimate that each sample is at least 20 tokens
+        num_samples = self.max_length // 20
+
+        if self.use_data_server:
+            request = SampleDataRequest(num_samples=num_samples)
+            return self.stub.SampleData(request)
+
+        # choice group based on their number of samples
+        group = random.choices(
+            self.groups, weights=[len(i.sentences) for i in self.groups], k=1
+        )[0]
+
+        if self.causual:
+            # Sample in order
+            if num_samples >= len(group.sentences):
+                samples = group.sentences
+            else:
+                begin = random.randint(0, len(group.sentences) - num_samples)
+                samples = group.sentences[begin : begin + num_samples]
+        else:
+            samples = random.choices(
+                group.sentences, k=min(num_samples, len(group.sentences))
+            )
+
+        return SampledData(
+            source=group.source,
+            name=group.name,
+            samples=samples,
+        )
+
     def augment(self):
         # 50% to pure text or pure phones
         mode = "sample"
@@ -249,15 +322,16 @@ class AutoAugTextDataset(IterableDataset):
         remaining_tokens = a.long().item() - 4
 
         final_text, final_semantic = [], []
-
-        # Shuffle unique lines, estimate that each sample is at least 20 tokens
-        request = SampleDataRequest(num_samples=self.max_length // 20)
-        response = self.stub.SampleData(request)
+        response = self.sample_data()
         if len(response.samples) == 0:
             # Invalid group
             return None
 
         samples = list(response.samples)
+        idx = 0
+        use_interactive = random.random() < self.interactive_prob
+
+        all_tokens, all_labels = [], []
         while remaining_tokens > 0 and len(samples) > 0:
             if random.random() < self.repetition_prob:
                 # Repeat the same sentence
@@ -269,70 +343,106 @@ class AutoAugTextDataset(IterableDataset):
                 sentence.text, sentence.phones, mode=mode
             )
             remaining_tokens -= length + len(sentence.semantics[0].values)
-            final_text.append(text)
-            final_semantic.append(sentence.semantics)
 
-        if self.use_speaker:
-            final_text = [f"[SPK: {response.name}]"] + final_text
+            if use_interactive is False:
+                final_text.append(text)
+                final_semantic.append(sentence.semantics)
+            else:
+                # For interactive mode, we only apply speaker for the first sentence
+                # [INST] [SPK: speaker] text [/INST] ... [INST] text [/INST]
+                tokens, labels = self.pack_sentences(
+                    sentences=[text],
+                    semantics=[sentence.semantics],
+                    speaker=response.name if (self.use_speaker and idx == 0) else None,
+                    add_bos=idx == 0,
+                )
 
-        final_text = "[INST] " + " ".join(final_text) + " [/INST]"
+                all_tokens.append(tokens)
+                all_labels.append(labels)
+
+            idx += 1
+
+        if use_interactive is False:
+            tokens, labels = self.pack_sentences(
+                final_text,
+                semantics=final_semantic,
+                speaker=None if self.use_speaker else response.name,
+                add_bos=True,
+            )
+        else:
+            tokens = torch.cat(all_tokens, dim=1)
+            labels = torch.cat(all_labels, dim=1)
+
+        # Verify that the length is correct
+        assert tokens.size(1) == labels.size(1), f"{tokens.size(1)} != {labels.size(1)}"
+
+        # Verify only one <s> token
+        assert (tokens[:, 0] == self.tokenizer.bos_token_id).sum() == 1
+
+        return {"tokens": tokens, "labels": labels}
+
+    def pack_sentences(
+        self,
+        sentences: list[str],
+        semantics=list,
+        speaker: Optional[str] = None,
+        add_bos: bool = True,
+    ):
+        if speaker is not None:
+            sentences = [f"[SPK: {speaker}]"] + sentences
+
+        final_text = "[INST] " + " ".join(sentences) + " [/INST]"
         encoded = self.tokenizer.encode(
             final_text,
             add_special_tokens=False,
             truncation=False,
             max_length=10**6,
         )
-        semantic_length = sum([len(i[0].values) for i in final_semantic])
+        semantic_length = sum([len(i[0].values) for i in semantics])
+        bos_bias = 1 if add_bos else 0
 
-        # Single codebook
-        if len(final_semantic[0]) == 1:
-            semantic_tokens = [f"<s:{j}>" for i in final_semantic for j in i[0].values]
-            tokenized = self.tokenizer.encode(
-                f" ".join(semantic_tokens),
-                add_special_tokens=False,
-                truncation=False,
-                max_length=10**6,
-            )
+        # Pack the tokens and semantics (add <s> and </s> to semantic tokens)
+        tokens = (
+            encoded
+            + [self.tokenizer.pad_token_id] * semantic_length
+            + [self.tokenizer.eos_token_id]
+        )
 
-            # Pack the tokens and semantics (add <s> and </s> to semantic tokens)
-            tokens = (
-                [self.tokenizer.bos_token_id]
-                + encoded
-                + tokenized
-                + [self.tokenizer.eos_token_id]
-            )
-            tokens = torch.tensor([tokens], dtype=torch.long)
-            labels = tokens.clone()
-            labels[0, : len(encoded) + 1] = -100  # Mask out the <s> and query tokens
-        else:
-            # Pack the tokens and semantics (add <s> and </s> to semantic tokens)
-            tokens = (
-                [self.tokenizer.bos_token_id]
-                + encoded
-                + [self.tokenizer.pad_token_id] * semantic_length
-                + [self.tokenizer.eos_token_id]
-            )
-            codes = [[0] * (len(encoded) + 1) for _ in range(len(final_semantic[0]))]
-            for segment in final_semantic:
-                for book_idx, book in enumerate(segment):
-                    for j in book.values:
-                        codes[book_idx].append(int(j) + 2)
+        if add_bos:
+            tokens = [self.tokenizer.bos_token_id] + tokens
 
-            for book in codes:
-                book.append(1)
+        # Codebook bos/padding: 0, eos: 1
+        codes = [
+            [CODEBOOK_BOS_TOKEN_ID] * (len(encoded) + bos_bias)
+            for _ in range(len(semantics[0]))
+        ]
+        for segment in semantics:
+            for book_idx, book in enumerate(segment):
+                for j in book.values:
+                    codes[book_idx].append(int(j) + 2)
 
-            tokens = [tokens] + codes
+        for book in codes:
+            book.append(CODEBOOK_EOS_TOKEN_ID)
 
-            tokens = torch.tensor(tokens, dtype=torch.long)
-            labels = tokens.clone()
-            labels[
-                1:, : len(encoded) + 1
-            ] = -100  # Mask out the <s> tokens for semantic
+        tokens = [tokens] + codes
 
-        return {
-            "tokens": tokens[:, :-1],
-            "labels": labels[:, 1:],
-        }
+        tokens = torch.tensor(tokens, dtype=torch.long)
+        labels = tokens.clone()
+
+        # Mask out the <s> tokens for semantic, predict semantic tokens only
+        # Since we don't mask out the input tokens, the language modeling still works
+        labels[1:, : (len(encoded) + bos_bias)] = -100
+
+        tokens = tokens[:, :-1]
+        labels = labels[:, 1:]
+
+        # Verify the padding is correct, and the last token is eos
+        assert add_bos is False or tokens[0, 0] == self.tokenizer.bos_token_id
+        assert (tokens[1:, : len(encoded) + bos_bias] == CODEBOOK_BOS_TOKEN_ID).all()
+        assert labels[0, -1] == self.tokenizer.eos_token_id
+        assert (labels[1:, -1] == CODEBOOK_EOS_TOKEN_ID).all()
+
+        return tokens, labels
 
 
 @dataclass
@@ -346,18 +456,20 @@ class TextDataCollator:
             _tokens = example["tokens"][:, : self.max_length]
             _labels = example["labels"][:, : self.max_length]
             _attention_mask = torch.ones((self.max_length,), dtype=torch.bool)
-            _attention_mask[: _tokens.size(1)] = False
+            tokens_length = _tokens.size(1)
+            _attention_mask[:tokens_length] = False
 
-            assert _tokens.size(1) == _labels.size(
+            assert tokens_length == _labels.size(
                 1
-            ), f"{_tokens.size(1)} != {_labels.size(1)}"
+            ), f"{tokens_length} != {_labels.size(1)}"
 
-            if _tokens.size(1) < self.max_length:
+            if tokens_length < self.max_length:
                 _tokens = F.pad(
                     _tokens,
-                    (0, self.max_length - _tokens.size(1)),
+                    (0, self.max_length - tokens_length),
                     value=self.tokenizer.eos_token_id,
                 )
+                _tokens[1:, tokens_length:] = CODEBOOK_EOS_TOKEN_ID
                 _labels = F.pad(
                     _labels, (0, self.max_length - _labels.size(1)), value=-100
                 )
@@ -444,19 +556,21 @@ class TextDataModule(LightningDataModule):
 
 
 if __name__ == "__main__":
-    import json
-
     from tqdm import tqdm
+
+    # ds = AutoAugTextDataset(
+    #     tokenizer=AutoTokenizer.from_pretrained("fishaudio/speech-lm-v1"),
+    #     use_speaker=True,
+    #     interactive_prob=1.0,
+    # )
 
     ds = AutoAugTextDataset(
         tokenizer=AutoTokenizer.from_pretrained("fishaudio/speech-lm-v1"),
         use_speaker=True,
+        interactive_prob=1.0,
+        use_data_server=False,
+        proto_files=["data/wenet-speech.protos"],
     )
-
-    # ds = StreamTextDataset(
-    #     prefix="en/",
-    #     tokenizer=AutoTokenizer.from_pretrained("fishaudio/speech-lm-v1"),
-    # )
 
     dm = TextDataModule(
         train_dataset=ds,

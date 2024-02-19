@@ -56,7 +56,7 @@ class ModelArgs:
 
 class KVCache(nn.Module):
     def __init__(
-        self, max_batch_size, max_seq_len, n_heads, head_dim, dtype=torch.float32
+        self, max_batch_size, max_seq_len, n_heads, head_dim, dtype=torch.bfloat16
     ):
         super().__init__()
         cache_shape = (max_batch_size, n_heads, max_seq_len, head_dim)
@@ -123,7 +123,7 @@ class Transformer(nn.Module):
         self.max_seq_len = -1
 
     def setup_caches(
-        self, max_batch_size: int, max_seq_len: int, dtype: torch.dtype = torch.float32
+        self, max_batch_size: int, max_seq_len: int, dtype: torch.dtype = torch.bfloat16
     ):
         if self.max_seq_len >= max_seq_len and self.max_batch_size >= max_batch_size:
             return
@@ -495,7 +495,7 @@ def precompute_freqs_cis(seq_len: int, n_elem: int, base: int = 10000) -> Tensor
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     cache = torch.stack([freqs_cis.real, freqs_cis.imag], dim=-1)
-    return cache.to(dtype=torch.float32)
+    return cache.to(dtype=torch.bfloat16)
 
 
 def apply_rotary_emb(x: Tensor, freqs_cis: Tensor) -> Tensor:
@@ -527,7 +527,7 @@ if __name__ == "__main__":
     )
 
     model = Transformer(args)
-    model = model.float().cuda()
+    model = model.cuda().bfloat16()
     print("Total params:", sum(i.numel() for i in model.parameters()) / 1024 / 1024)
 
     inputs = torch.randint(0, 100, (2, 5, 128)).cuda()
