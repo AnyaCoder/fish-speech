@@ -8,7 +8,7 @@ import numpy as np
 import yaml
 from loguru import logger
 from tqdm import tqdm
-
+import torch.distributed.utils
 from fish_speech.datasets.protos.text_data_pb2 import Semantics, Sentence, TextData
 from fish_speech.datasets.protos.text_data_stream import pack_pb_stream
 from fish_speech.text import g2p
@@ -79,7 +79,7 @@ def run_task(task):
                 logger.warning(f"Can't find {txt_file}")
                 continue
 
-            with open(txt_file, "r") as f:
+            with open(txt_file, "r", encoding="utf-8") as f:
                 text = f.read().strip()
 
         # Simple cleaning: replace { xxx } and < xxx > with space

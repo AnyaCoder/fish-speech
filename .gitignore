@@ -15,3 +15,5 @@ filelists
 /*.wav
 /results
 /data
+/protoc-25.3-win64
+/.idea

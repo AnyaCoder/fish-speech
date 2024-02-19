@@ -28,7 +28,7 @@ class VQGANDataset(Dataset):
 
         self.files = [
             root / line.strip()
-            for line in filelist.read_text().splitlines()
+            for line in filelist.read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]
         self.sample_rate = sample_rate
