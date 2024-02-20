@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import html
 import os
+import platform
+import random
+import signal
 import sys
 from pathlib import Path
 import shutil
 import subprocess
 from typing import Iterable
 import gradio as gr
+import psutil
 import yaml
 from gradio.themes.base import Base
 from gradio.themes.utils import colors, fonts, sizes
@@ -96,6 +100,52 @@ def load_data_in_raw(path):
     with open(path, "r", encoding="utf-8") as file:
         data = file.read()
     return str(data)
+
+
+def kill_proc_tree(pid, including_parent=True):
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        # Process already terminated
+        return
+
+    children = parent.children(recursive=True)
+    for child in children:
+        try:
+            os.kill(child.pid, signal.SIGTERM)  # or signal.SIGKILL
+        except OSError:
+            pass
+    if including_parent:
+        try:
+            os.kill(parent.pid, signal.SIGTERM)  # or signal.SIGKILL
+        except OSError:
+            pass
+
+
+system = platform.system()
+p_label = None
+
+
+def kill_process(pid):
+    if system == "Windows":
+        cmd = "taskkill /t /f /pid %s" % pid
+        os.system(cmd)
+    else:
+        kill_proc_tree(pid)
+
+
+def change_label(if_label, path_list=str(Path("data/demo/detect.list").resolve())):
+    global p_label
+    port = random.randint(8888, 65535)
+    if if_label == True and p_label == None:
+        cmd = '"%s" tools/subfix_webui.py --load_list "%s" --webui_port %s --is_share %s' % (
+            PYTHON, path_list, str(port), str(False))
+        yield f"打标工具WebUI已开启, 访问：http://127.0.0.1:{port}"
+        p_label = subprocess.Popen(cmd, shell=True)
+    elif if_label == False and p_label != None:
+        kill_process(p_label.pid)
+        p_label = None
+        yield "打标工具WebUI已关闭"
 
 
 js = load_data_in_raw("fish_speech/webui/js/animate.js")
@@ -245,9 +295,10 @@ def check_files(data_path: str, max_depth: int, label_model: str, label_device: 
             cur_lang = dict_to_language[content["label_lang"]]
             if cur_lang != "WTF":
                 try:
-                    subprocess.run([PYTHON, "tools/whisper_asr.py", "--model-size", label_model, "--device", label_device,
-                                    "--audio-dir", item_path, "--save-dir", item_path, "--language", cur_lang],
-                                   env=os.environ.copy())
+                    subprocess.run(
+                        [PYTHON, "tools/whisper_asr.py", "--model-size", label_model, "--device", label_device,
+                         "--audio-dir", item_path, "--save-dir", item_path, "--language", cur_lang],
+                        env=os.environ.copy())
                 except Exception:
                     exit()
             if content["method"] == "复制一份":
@@ -259,6 +310,7 @@ def check_files(data_path: str, max_depth: int, label_model: str, label_device: 
         elif content["type"] == "file" and item_path.is_file():
             list_copy(item_path, content["method"])
 
+    subprocess.run([PYTHON, "tools/extract_list.py"])
     return build_html_ok_message("文件移动完毕"), new_explorer(data_path, max_depth=max_depth)
 
 
@@ -306,7 +358,7 @@ def train_process(data_path: str, option: str):
         subprocess.run([PYTHON, "tools/llama/build_dataset.py",
                         "--output", "data/quantized-dataset-ft.protos", "--num-workers", "16"])
 
-        subprocess.Popen(["data_server/target/release/data_server", "--files", "data/quantized-dataset-ft.protos"])
+        subprocess.run([PYTHON, "fish_speech/train.py", "--config", "text2sematic_finetune"])
 
     return build_html_ok_message("训练终止")
 
@@ -336,15 +388,20 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
                                                  info="支持 Bert-Vits2 / GPT-SoVITS 格式",
                                                  interactive=True)
                 with gr.Row(equal_height=False):
-                    output_radio = gr.Radio(label="\U0001F4C1 选择源文件(夹)处理方式", choices=['复制一份', '直接移动'],
-                                            value="复制一份", interactive=True)
-                    error = gr.HTML(label="错误信息")
+                    with gr.Column():
+                        output_radio = gr.Radio(label="\U0001F4C1 选择源文件(夹)处理方式",
+                                                choices=['复制一份', '直接移动'],
+                                                value="复制一份", interactive=True)
+                    with gr.Column():
+                        error = gr.HTML(label="错误信息")
+                        if_label = gr.Checkbox(label="是否开启打标WebUI", scale=0, show_label=True)
                 with gr.Row():
                     add_button = gr.Button("\U000027A1提交到处理区", variant="primary")
                     remove_button = gr.Button("\U000026D4 取消所选内容")
 
                 with gr.Row():
-                    label_device = gr.Dropdown(label="打标设备", info="建议使用cuda, 实在是低配置再用cpu", choices=["cpu", "cuda"],
+                    label_device = gr.Dropdown(label="打标设备", info="建议使用cuda, 实在是低配置再用cpu",
+                                               choices=["cpu", "cuda"],
                                                value="cuda", interactive=True)
                     label_model = gr.Dropdown(label="打标模型大小", info="显存10G以上用large, 5G用medium, 2G用small",
                                               choices=["large", "medium", "small"],
@@ -471,6 +528,7 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
     help_button.click(fn=None,
                       js='() => { window.open("https://speech.fish.audio/", "newwindow", "height=100, width=400, '
                          'toolbar=no, menubar=no, scrollbars=no, resizable=no, location=no, status=no")}')
+    if_label.change(fn=change_label, inputs=[if_label], outputs=[error])
     train_btn.click(fn=train_process, inputs=[train_box, model_type_radio], outputs=[error])
     admit_btn.click(fn=check_files, inputs=[train_box, tree_slider, label_model, label_device],
                     outputs=[error, file_markdown])
@@ -489,4 +547,5 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
                                     llama_precision_dropdown, llama_every_n_steps_slider],
                             outputs=[llama_error])
     infer_btn.click(fn=infer_process, inputs=[infer_host_textbox, infer_port_textbox], outputs=[infer_error])
-demo.launch()
+
+demo.launch(inbrowser=True)
