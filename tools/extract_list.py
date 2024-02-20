@@ -1,4 +1,5 @@
 import argparse
+import os
 from pathlib import Path
 from loguru import logger
 from tqdm import tqdm
@@ -8,6 +9,7 @@ from tqdm import tqdm
 import langid
 lang_dict = {'en': 'EN', 'zh': 'ZH', 'ja': "JP"}
 langid.set_languages(['en', 'zh', 'ja'])
+project_root = os.environ.get('PYTHONPATH', '.')
 
 def extract_list(folder_path, transcript_file):
 
@@ -34,7 +36,7 @@ def extract_list(folder_path, transcript_file):
             except:
                 language = "ZH"
             if wav_file_path.is_file():
-                line = f"{str(wav_file_path)}|{first_folder_name}|{language}|{transcription}\n"
+                line = f"{str(wav_file_path.relative_to(project_root))}|{first_folder_name}|{language}|{transcription}\n"
                 f.write(line)
             else:
                 logger.warning(f"不存在对应音频 {wav_file_path}!")

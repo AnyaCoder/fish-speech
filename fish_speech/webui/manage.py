@@ -9,76 +9,26 @@ import sys
 from pathlib import Path
 import shutil
 import subprocess
-from typing import Iterable
+
 import gradio as gr
 import psutil
 import yaml
-from gradio.themes.base import Base
-from gradio.themes.utils import colors, fonts, sizes
+
 import json
 from loguru import logger
 from tqdm import tqdm
+
+from fish_speech.webui.launch_utils import Seafoam, versions_html
 
 sys.path.insert(0, '')
 print(sys.path)
 PYTHON = os.path.join(os.environ.get('PYTHON_FOLDERPATH', ''), 'python')
 vqgan_yml_path = "fish_speech/configs/vqgan_finetune.yaml"
 llama_yml_path = "fish_speech/configs/text2semantic_finetune.yaml"
-
-
-class Seafoam(Base):
-    def __init__(
-            self,
-            *,
-            primary_hue: colors.Color | str = colors.emerald,
-            secondary_hue: colors.Color | str = colors.blue,
-            neutral_hue: colors.Color | str = colors.blue,
-            spacing_size: sizes.Size | str = sizes.spacing_md,
-            radius_size: sizes.Size | str = sizes.radius_md,
-            text_size: sizes.Size | str = sizes.text_lg,
-            font: fonts.Font
-                  | str
-                  | Iterable[fonts.Font | str] = (
-                    fonts.GoogleFont("Quicksand"),
-                    "ui-sans-serif",
-                    "sans-serif",
-            ),
-            font_mono: fonts.Font
-                       | str
-                       | Iterable[fonts.Font | str] = (
-                    fonts.GoogleFont("IBM Plex Mono"),
-                    "ui-monospace",
-                    "monospace",
-            ),
-    ):
-        super().__init__(
-            primary_hue=primary_hue,
-            secondary_hue=secondary_hue,
-            neutral_hue=neutral_hue,
-            spacing_size=spacing_size,
-            radius_size=radius_size,
-            text_size=text_size,
-            font=font,
-            font_mono=font_mono,
-        )
-        super().set(
-            button_primary_background_fill="linear-gradient(90deg, *primary_300, *secondary_400)",
-            button_primary_background_fill_hover="linear-gradient(90deg, *primary_200, *secondary_300)",
-            button_primary_text_color="white",
-            button_primary_background_fill_dark="linear-gradient(90deg, *primary_600, *secondary_800)",
-            slider_color="*secondary_300",
-            slider_color_dark="*secondary_600",
-            block_title_text_weight="600",
-            block_border_width="3px",
-            block_shadow="*shadow_drop_lg",
-            button_shadow="*shadow_drop_lg",
-            button_small_padding="0px",
-            button_large_padding="3px",
-        )
-
+env = os.environ.copy()
+env["no_proxy"] = "127.0.0.1, localhost, 0.0.0.0"
 
 seafoam = Seafoam()
-
 
 def build_html_error_message(error):
     return f"""
@@ -86,7 +36,6 @@ def build_html_error_message(error):
         {html.escape(error)}
     </div>
     """
-
 
 def build_html_ok_message(msg):
     return f"""
@@ -129,7 +78,8 @@ p_label = None
 def kill_process(pid):
     if system == "Windows":
         cmd = "taskkill /t /f /pid %s" % pid
-        os.system(cmd)
+        # os.system(cmd)
+        subprocess.run(cmd)
     else:
         kill_proc_tree(pid)
 
@@ -141,7 +91,7 @@ def change_label(if_label, path_list=str(Path("data/demo/detect.list").resolve()
         cmd = '"%s" tools/subfix_webui.py --load_list "%s" --webui_port %s --is_share %s' % (
             PYTHON, path_list, str(port), str(False))
         yield f"打标工具WebUI已开启, 访问：http://127.0.0.1:{port}"
-        p_label = subprocess.Popen(cmd, shell=True)
+        p_label = subprocess.Popen(cmd, shell=True, env=env)
     elif if_label == False and p_label != None:
         kill_process(p_label.pid)
         p_label = None
@@ -155,7 +105,7 @@ default_output = Path(__file__).parent.parent.parent / "data" / "demo"
 default_output = default_output.resolve()
 default_model_output = Path(__file__).parent.parent.parent / "results"
 default_model_output = default_model_output.resolve()
-
+default_filelist = Path("data/demo/detect.list").resolve()
 default_output.mkdir(parents=True, exist_ok=True)
 
 items = []
@@ -286,11 +236,13 @@ def check_files(data_path: str, max_depth: int, label_model: str, label_device: 
         "日文": "JP",
         "不打标": "WTF"
     }
+
     global dict_items
     data_path = Path(data_path)
     for item, content in dict_items.items():
         item_path = Path(item)
         tar_path = data_path / item_path.name
+
         if content["type"] == "folder" and item_path.is_dir():
             cur_lang = dict_to_language[content["label_lang"]]
             if cur_lang != "WTF":
@@ -298,7 +250,7 @@ def check_files(data_path: str, max_depth: int, label_model: str, label_device: 
                     subprocess.run(
                         [PYTHON, "tools/whisper_asr.py", "--model-size", label_model, "--device", label_device,
                          "--audio-dir", item_path, "--save-dir", item_path, "--language", cur_lang],
-                        env=os.environ.copy())
+                        env=env)
                 except Exception:
                     exit()
             if content["method"] == "复制一份":
@@ -310,7 +262,7 @@ def check_files(data_path: str, max_depth: int, label_model: str, label_device: 
         elif content["type"] == "file" and item_path.is_file():
             list_copy(item_path, content["method"])
 
-    subprocess.run([PYTHON, "tools/extract_list.py"])
+    subprocess.run([PYTHON, "tools/extract_list.py"], env=env)
     return build_html_ok_message("文件移动完毕"), new_explorer(data_path, max_depth=max_depth)
 
 
@@ -348,17 +300,18 @@ def modify_llama_trainer_param(max_length, max_steps, lr,
 
 def train_process(data_path: str, option: str):
     if option == "VQGAN" or option == "all":
-        subprocess.run([PYTHON, "tools/vqgan/create_train_split.py", str(default_output)])
+        subprocess.run([PYTHON, "tools/vqgan/create_train_split.py", "--filelist", str(default_filelist)])
         subprocess.run([PYTHON, "fish_speech/train.py", "--config-name", "vqgan_finetune"])
 
     if option == "LLAMA" or option == "all":
-        subprocess.run([PYTHON, "tools/vqgan/extract_vq.py", "data/demo",
+        subprocess.run([PYTHON, "tools/vqgan/extract_vq.py", "--filelist", str(default_filelist),
                         "--num-workers", "1", "--batch-size", "16", "--checkpoint-path", "checkpoints/vqgan-v1.pth"])
 
         subprocess.run([PYTHON, "tools/llama/build_dataset.py",
                         "--output", "data/quantized-dataset-ft.protos", "--num-workers", "16"])
 
-        subprocess.run([PYTHON, "fish_speech/train.py", "--config", "text2sematic_finetune"])
+        subprocess.run([PYTHON, "fish_speech/train.py",
+                        "--config", "text2sematic_finetune"])
 
     return build_html_ok_message("训练终止")
 
@@ -371,6 +324,7 @@ def infer_process(host, port):
     # 启动第二个进程
     subprocess.Popen([PYTHON, "fish_speech/webui/app.py"], env=env)
     return build_html_ok_message(f'推理界面已开启, 访问 http://{host}:{port}')
+
 
 
 init_vqgan_yml = load_yaml_data_in_fact(vqgan_yml_path)
@@ -520,6 +474,11 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
                 fresh_btn = gr.Button("\U0001F503", scale=0, min_width=80)
                 help_button = gr.Button("\U00002753", scale=0, min_width=80)  # question
                 train_btn = gr.Button("训练启动!", variant="primary")
+
+    footer = load_data_in_raw("fish_speech/webui/html/footer.html")
+    footer = footer.format(versions=versions_html(),
+                           api_docs="https://speech.fish.audio/inference/#http-api")
+    gr.HTML(footer, elem_id="footer")
 
     add_button.click(fn=add_item, inputs=[textbox, output_radio, transcript_path, label_radio],
                      outputs=[checkbox_group, error])
