@@ -1,4 +1,5 @@
 import random
+import sys
 from dataclasses import dataclass
 from itertools import chain
 from random import Random
@@ -193,8 +194,8 @@ class AutoAugTextDataset(IterableDataset):
         max_length: int = 1024,
         tokenizer: AutoTokenizer = None,
         use_speaker: bool = True,
-        use_data_server: bool = False,
-        proto_files: str = "data",
+        use_data_server: bool = False if sys.platform == "win32" else True,
+        proto_files: list = ["data/quantized-dataset-ft.protos"],
         causual: bool = True,
     ):
         """
@@ -563,13 +564,13 @@ if __name__ == "__main__":
     #     use_speaker=True,
     #     interactive_prob=1.0,
     # )
-
+    from pathlib import Path
     ds = AutoAugTextDataset(
-        tokenizer=AutoTokenizer.from_pretrained("fishaudio/speech-lm-v1"),
+        tokenizer=AutoTokenizer.from_pretrained(str(Path("checkpoints").resolve())),
         use_speaker=True,
         interactive_prob=1.0,
         use_data_server=False,
-        proto_files=["data/wenet-speech.protos"],
+        proto_files=[str(Path("data/quantized-dataset-ft.protos").resolve())],
     )
 
     dm = TextDataModule(

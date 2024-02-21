@@ -300,18 +300,23 @@ def modify_llama_trainer_param(max_length, max_steps, lr,
 
 def train_process(data_path: str, option: str):
     if option == "VQGAN" or option == "all":
-        subprocess.run([PYTHON, "tools/vqgan/create_train_split.py", "--filelist", str(default_filelist)])
+        subprocess.run([PYTHON, "tools/vqgan/create_train_split.py", "data/demo", "--filelist", str(default_filelist)])
         subprocess.run([PYTHON, "fish_speech/train.py", "--config-name", "vqgan_finetune"])
 
     if option == "LLAMA" or option == "all":
-        subprocess.run([PYTHON, "tools/vqgan/extract_vq.py", "--filelist", str(default_filelist),
-                        "--num-workers", "1", "--batch-size", "16", "--checkpoint-path", "checkpoints/vqgan-v1.pth"])
+        subprocess.run([PYTHON, "tools/vqgan/extract_vq.py",  "data/demo", "--filelist", str(default_filelist),
+                        "--num-workers", "1", "--batch-size", "16", "--config-name", "vqgan_pretrain",
+                        "--checkpoint-path", "checkpoints/vqgan-v1.pth"])
 
         subprocess.run([PYTHON, "tools/llama/build_dataset.py",
+                        "--config", "fish_speech/configs/data/finetune.yaml",
+                        "--filelist", str(default_filelist),
                         "--output", "data/quantized-dataset-ft.protos", "--num-workers", "16"])
+        if sys.platform == 'linux':
+            subprocess.Popen(["data_server/target/release/data_server", "--files", "data/quantized-dataset-ft.protos"])
 
         subprocess.run([PYTHON, "fish_speech/train.py",
-                        "--config", "text2sematic_finetune"])
+                        "--config-name", "text2semantic_finetune"])
 
     return build_html_ok_message("训练终止")
 
@@ -324,7 +329,6 @@ def infer_process(host, port):
     # 启动第二个进程
     subprocess.Popen([PYTHON, "fish_speech/webui/app.py"], env=env)
     return build_html_ok_message(f'推理界面已开启, 访问 http://{host}:{port}')
-
 
 
 init_vqgan_yml = load_yaml_data_in_fact(vqgan_yml_path)
@@ -411,7 +415,7 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
                                                                        init_vqgan_yml["callbacks"]["model_checkpoint"][
                                                                            "every_n_train_steps"])
                     with gr.Row():
-                        with gr.Accordion("LLAMA配置项", open=False):
+                        with gr.Accordion("LLAMA配置项(windows暂不支持该模型训练)", open=False):
                             with gr.Row(equal_height=False):
                                 llama_trainer_btn = gr.Button("确认")
                                 llama_error = gr.HTML(label="错误信息")
@@ -427,8 +431,9 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
                                                                            value=init_llama_yml["trainer"][
                                                                                "limit_val_batches"])
                             with gr.Accordion("data 配置", open=False):
-                                llama_data_num_workers_slider = gr.Slider(label="num_workers", interactive=True,
-                                                                          minimum=1, maximum=16, step=1,
+                                llama_data_num_workers_slider = gr.Slider(label="num_workers",
+                                                                          interactive=False if sys.platform == "win32" else True,
+                                                                          minimum=0, maximum=16, step=1,
                                                                           value=init_llama_yml["data"]["num_workers"])
 
                                 llama_data_batch_size_slider = gr.Slider(label="batch_size", interactive=True,

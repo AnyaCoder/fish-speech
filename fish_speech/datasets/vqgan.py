@@ -117,6 +117,7 @@ class VQGANDataModule(LightningDataModule):
             collate_fn=VQGANCollator(),
             num_workers=self.num_workers,
             shuffle=True,
+            persistent_workers=True
         )
 
     def val_dataloader(self):
@@ -125,6 +126,7 @@ class VQGANDataModule(LightningDataModule):
             batch_size=self.batch_size,
             collate_fn=VQGANCollator(),
             num_workers=self.num_workers,
+            persistent_workers=True
         )
 
 

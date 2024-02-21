@@ -7,7 +7,7 @@ from einops import rearrange
 from torch import Tensor
 from torch.nn import functional as F
 from transformers.utils import is_flash_attn_2_available
-
+import torch.utils.checkpoint as torch_ckpt
 if is_flash_attn_2_available():
     from flash_attn import flash_attn_func, flash_attn_varlen_func
     from flash_attn.bert_padding import index_first_axis, pad_input, unpad_input  # noqa
@@ -80,7 +80,7 @@ class TransformerForwardResult:
     token_logits: Tensor
     codebook_logits: Tensor
 
-
+from loguru import logger
 class Transformer(nn.Module):
     def __init__(self, config: ModelArgs) -> None:
         super().__init__()
@@ -167,7 +167,7 @@ class Transformer(nn.Module):
     ) -> TransformerForwardResult:
         for layer in self.layers:
             if self.config.use_gradient_checkpointing and self.training:
-                x = torch.utils.checkpoint.checkpoint(
+                x = torch_ckpt.checkpoint(
                     layer, x, freqs_cis, mask, input_pos, use_reentrant=True
                 )
             else:

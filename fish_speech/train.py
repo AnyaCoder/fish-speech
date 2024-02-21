@@ -54,7 +54,8 @@ def train(cfg: DictConfig) -> tuple[dict, dict]:
     log.info(f"Instantiating trainer <{cfg.trainer._target_}>")
     trainer: Trainer = hydra.utils.instantiate(
         cfg.trainer, callbacks=callbacks, logger=logger,
-        strategy=DDPStrategy(process_group_backend="nccl" if sys.platform == "linux" else "gloo", find_unused_parameters=True)
+        strategy=DDPStrategy(process_group_backend="nccl" if sys.platform == "linux" else "gloo",
+                             find_unused_parameters=True)
     )
 
     object_dict = {

@@ -124,10 +124,9 @@ train_dataset:
 trainer:
   accelerator: gpu
   devices: auto
-  max_steps: 3000
-  precision: '16'
+  max_steps: 2000
+  precision: '32'
   strategy: ddp_find_unused_parameters_true
-
   val_check_interval: 1000
 val_dataset:
   _target_: fish_speech.datasets.vqgan.VQGANDataset
