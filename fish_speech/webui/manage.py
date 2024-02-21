@@ -432,22 +432,27 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
                                                                                "limit_val_batches"])
                             with gr.Accordion("data 配置", open=False):
                                 llama_data_num_workers_slider = gr.Slider(label="num_workers",
-                                                                          interactive=False if sys.platform == "win32" else True,
+                                                                          interactive=False
+                                                                          if sys.platform == "win32" else True,
                                                                           minimum=0, maximum=16, step=1,
-                                                                          value=init_llama_yml["data"]["num_workers"])
+                                                                          value=init_llama_yml["data"]["num_workers"]
+                                                                          if sys.platform == "linux" else 0
+                                                                          )
 
                                 llama_data_batch_size_slider = gr.Slider(label="batch_size", interactive=True,
                                                                          minimum=1, maximum=32, step=1,
-                                                                         value=init_llama_yml["data"]["batch_size"])
+                                                                         value=init_llama_yml["data"]["batch_size"]
+                                                                         )
                                 llama_data_max_length_slider = gr.Slider(label="max_length", interactive=True,
                                                                          minimum=1024, maximum=4096, step=128,
                                                                          value=init_llama_yml["max_length"])
 
                             with gr.Accordion("其他配置", open=False):
-                                llama_precision_dropdown = gr.Dropdown(label="训练精度", interactive=True,
-                                                                       choices=["32", "bf16-true", "16"],
-                                                                       value=str(
-                                                                           init_llama_yml["trainer"]["precision"]))
+                                llama_precision_dropdown = gr.Dropdown(label="训练精度", interactive=False,
+                                                                       choices=["32", "bf16-true", "16-mixed"],
+                                                                       value="bf16-true"
+                                                                       if sys.platform == 'linux' else "16-mixed"
+                                                                       )
                                 llama_every_n_steps_slider = gr.Slider(label="每n步保存一个模型", interactive=True,
                                                                        minimum=500, maximum=10000, step=500,
                                                                        value=

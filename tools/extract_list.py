@@ -9,7 +9,7 @@ from tqdm import tqdm
 import langid
 lang_dict = {'en': 'EN', 'zh': 'ZH', 'ja': "JP"}
 langid.set_languages(['en', 'zh', 'ja'])
-project_root = os.environ.get('PYTHONPATH', '.')
+project_root = str(Path(__file__).parent.parent.resolve())
 
 def extract_list(folder_path, transcript_file):
 

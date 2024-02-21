@@ -214,7 +214,7 @@ class AutoAugTextDataset(IterableDataset):
         """
 
         super().__init__()
-
+        log.info(f"use_data_server={use_data_server}")
         self.seed = seed
         self.phones_prob = phones_prob
         self.max_length = max_length

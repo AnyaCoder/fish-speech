@@ -6,7 +6,7 @@ data:
   _target_: fish_speech.datasets.text.TextDataModule
   batch_size: 1
   max_length: ${max_length}
-  num_workers: 4
+  num_workers: 0
   tokenizer: ${tokenizer}
   train_dataset: ${train_dataset}
   val_dataset: ${val_dataset}
@@ -62,8 +62,7 @@ trainer:
   gradient_clip_val: 1.0
   limit_val_batches: 1
   max_steps: 1000
-  precision: bf16-true
-  strategy: ddp_find_unused_parameters_true
+  precision: 16-mixed
 val_dataset:
   _target_: fish_speech.datasets.text.AutoAugTextDataset
   max_length: ${max_length}
