@@ -124,7 +124,7 @@ train_dataset:
 trainer:
   accelerator: gpu
   devices: auto
-  max_steps: 2000
+  max_steps: 1000
   precision: '32'
   strategy: ddp_find_unused_parameters_true
   val_check_interval: 1000
