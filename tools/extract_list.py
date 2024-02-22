@@ -7,6 +7,7 @@ from tqdm import tqdm
 # DetectorFactory.seed = 114514
 # lang_dict = {'en': 'EN', 'zh-cn': "ZH", 'zh-tw': 'ZH', 'ja': "JP", 'ko': "KO"}
 import langid
+from collections import defaultdict
 lang_dict = {'en': 'EN', 'zh': 'ZH', 'ja': "JP"}
 langid.set_languages(['en', 'zh', 'ja'])
 project_root = str(Path(__file__).parent.parent.resolve())
@@ -19,13 +20,15 @@ def extract_list(folder_path, transcript_file):
     transcript_file.parent.mkdir(parents=True, exist_ok=True)
 
     with transcript_file.open("w", encoding="utf-8") as f:
-        for lab_file_path in tqdm(folder_path.rglob("*.lab")):
-            transcription = lab_file_path.read_text(encoding="utf-8").strip()
+        k_lang_v_info = defaultdict(lambda: defaultdict(list))
+        k_char_v_lang = defaultdict(str)
+        for lab_path in tqdm(folder_path.rglob("*.lab")):
+            transcription = lab_path.read_text(encoding="utf-8").strip()
             if len(transcription) == 0:
                 continue
 
-            wav_file_path = lab_file_path.with_suffix(".wav")
-            relative_path = wav_file_path.relative_to(folder_path)
+            wav_path = lab_path.with_suffix(".wav")
+            relative_path = wav_path.relative_to(folder_path)
             parts = relative_path.parts
             if parts:
                 first_folder_name = parts[0]
@@ -35,11 +38,28 @@ def extract_list(folder_path, transcript_file):
                 language = lang_dict[langid.classify((first_folder_name + ',' + transcription) * 2)[0]]
             except:
                 language = "ZH"
-            if wav_file_path.is_file():
-                line = f"{str(wav_file_path.relative_to(project_root))}|{first_folder_name}|{language}|{transcription}\n"
-                f.write(line)
-            else:
-                logger.warning(f"不存在对应音频 {wav_file_path}!")
+
+            k_lang_v_info[first_folder_name][language].append(dict(
+                wav_path=str(wav_path.relative_to(project_root)),
+                transcription=transcription
+            ))
+        # langid is not 100% accurate! so the following is for robustness.
+        for character, ex_C_info in k_lang_v_info.items():
+            max_len = 0
+            max_lang = "ZH"
+            for lang, lst in ex_C_info.items():
+                if len(lst) > max_len:
+                    max_len = len(lst)
+                    max_lang = lang
+            for lang, lst in ex_C_info.items():
+                for info in lst:
+                    wav_path = Path(info["wav_path"]).resolve()
+                    transcription = info["transcription"]
+                    if wav_path.is_file():
+                        line = f"{wav_path.relative_to(project_root)}|{character}|{max_lang}|{transcription}\n"
+                        f.write(line)
+                    else:
+                        print(f"No such file or directory: {wav_path}")
 
     return f"转写文本 {transcript_file} 生成完成"
 
