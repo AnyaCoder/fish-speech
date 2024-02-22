@@ -14,4 +14,4 @@ echo $PATH
 python fish_speech/webui/manage.py
 
 # Wait for a key press before exiting
-read -p "Press any key to continue..." -n1 -s
+read -p "PrLinuess any key to continue..." -n1 -s

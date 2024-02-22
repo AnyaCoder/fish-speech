@@ -73,7 +73,7 @@ def kill_proc_tree(pid, including_parent=True):
 
 system = platform.system()
 p_label = None
-
+p_infer = None
 
 def kill_process(pid):
     if system == "Windows":
@@ -97,6 +97,20 @@ def change_label(if_label, path_list=str(Path("data/demo/detect.list").resolve()
         p_label = None
         yield "打标工具WebUI已关闭"
 
+def change_infer(if_infer, host, port):
+    global p_infer
+    if if_infer == True and p_infer == None:
+        subprocess.Popen([PYTHON, "-m", "zibai", "tools.api_server:app", "--listen", "127.0.0.1:8000"])
+        env = os.environ.copy()
+        env["GRADIO_SERVER_NAME"] = host
+        env["GRADIO_SERVER_PORT"] = port
+        # 启动第二个进程
+        yield build_html_ok_message(f'推理界面已开启, 访问 http://{host}:{port}')
+        p_infer = subprocess.Popen([PYTHON, "fish_speech/webui/app.py"], env=env)
+    elif if_infer == False and p_infer != None:
+        kill_process(p_infer.pid)
+        p_infer = None
+        yield build_html_error_message("推理界面已关闭")
 
 js = load_data_in_raw("fish_speech/webui/js/animate.js")
 css = load_data_in_raw("fish_speech/webui/css/style.css")
@@ -321,16 +335,6 @@ def train_process(data_path: str, option: str):
     return build_html_ok_message("训练终止")
 
 
-def infer_process(host, port):
-    subprocess.Popen([PYTHON, "-m", "zibai", "tools.api_server:app", "--listen", "127.0.0.1:8000"])
-    env = os.environ.copy()
-    env["GRADIO_SERVER_NAME"] = host
-    env["GRADIO_SERVER_PORT"] = port
-    # 启动第二个进程
-    subprocess.Popen([PYTHON, "fish_speech/webui/app.py"], env=env)
-    return build_html_ok_message(f'推理界面已开启, 访问 http://{host}:{port}')
-
-
 init_vqgan_yml = load_yaml_data_in_fact(vqgan_yml_path)
 init_llama_yml = load_yaml_data_in_fact(llama_yml_path)
 
@@ -465,10 +469,11 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
                             infer_host_textbox = gr.Textbox(label="Webui启动服务器地址", value="127.0.0.1")
                             infer_port_textbox = gr.Textbox(label="Webui启动服务器端口", value="7862")
                     with gr.Row():
-                        infer_btn = gr.Button(value="点击启动 webui", variant="primary")
+                        infer_checkbox = gr.Checkbox(label="是否打开推理界面")
                         infer_error = gr.HTML(label="推理界面错误信息")
 
         with gr.Column():
+            train_error = gr.HTML(label="训练时的报错信息")
             checkbox_group = gr.CheckboxGroup(label="\U0001F4CA 数据源列表",
                                               info="左侧输入文件夹所在路径或filelist。无论是否勾选，在此列表中都会被用以后续训练。",
                                               elem_classes=["data_src"])
@@ -498,7 +503,7 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
                       js='() => { window.open("https://speech.fish.audio/", "newwindow", "height=100, width=400, '
                          'toolbar=no, menubar=no, scrollbars=no, resizable=no, location=no, status=no")}')
     if_label.change(fn=change_label, inputs=[if_label], outputs=[error])
-    train_btn.click(fn=train_process, inputs=[train_box, model_type_radio], outputs=[error])
+    train_btn.click(fn=train_process, inputs=[train_box, model_type_radio], outputs=[train_error])
     admit_btn.click(fn=check_files, inputs=[train_box, tree_slider, label_model, label_device],
                     outputs=[error, file_markdown])
     fresh_btn.click(fn=new_explorer, inputs=[train_box, tree_slider], outputs=[file_markdown])
@@ -515,6 +520,6 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
                                     llama_limit_val_batches_slider,
                                     llama_precision_dropdown, llama_every_n_steps_slider],
                             outputs=[llama_error])
-    infer_btn.click(fn=infer_process, inputs=[infer_host_textbox, infer_port_textbox], outputs=[infer_error])
+    infer_checkbox.change(fn=change_infer, inputs=[infer_checkbox, infer_host_textbox, infer_port_textbox], outputs=[infer_error])
 
 demo.launch(inbrowser=True)
