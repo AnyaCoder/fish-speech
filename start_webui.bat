@@ -7,11 +7,10 @@ set PYTHONPATH=%~dp0
 set GIT_HOME=%~dp0PortableGit\bin
 set PYTHON_FOLDERPATH=%~dp0vits\
 set SCRIPT_FOLDERPATH=%~dp0vits\Scripts\
-
+set NLTK_DATA=%~dp0vits\nltk_data
 set NEW_PATH="%PYTHON_FOLDERPATH%;%SCRIPT_FOLDERPATH%;%PATH%;"
 set PATH=%NEW_PATH%
 
-echo %PATH%
 %PYTHON_FOLDERPATH%python fish_speech\webui\manage.py
 
 pause
