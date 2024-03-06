@@ -1,4 +1,8 @@
+import os
+import wave
 from pathlib import Path
+
+import numpy as np
 
 import html
 import io
@@ -160,24 +164,24 @@ def build_model_config_block():
         label="Llama 模型路径",
         value=str(Path("checkpoints/text2semantic-400m-v0.3-4k.pth")),
         choices=[str(pth_file) for pth_file in Path("results").rglob("*text*/*.ckpt")] + \
-                     [str(pth_file) for pth_file in Path("checkpoints").rglob("*text*.pth")],
+                [str(pth_file) for pth_file in Path("checkpoints").rglob("*text*.pth")],
         allow_custom_value=True
     )
     llama_config_name = gr.Textbox(label="Llama 配置文件", value="text2semantic_finetune")
     tokenizer = gr.Dropdown(label="Tokenizer",
-                           value="fishaudio/speech-lm-v1",
-                           choices=["fishaudio/speech-lm-v1", "checkpoints"]
-                           )
+                            value="fishaudio/speech-lm-v1",
+                            choices=["fishaudio/speech-lm-v1", "checkpoints"]
+                            )
 
     vqgan_ckpt_path = gr.Dropdown(label="VQGAN 模型路径",
                                   value=str(Path("checkpoints/vqgan-v1.pth")),
                                   choices=[str(pth_file) for pth_file in Path("results").rglob("*vqgan*/*.ckpt")] + \
-                                           [str(pth_file) for pth_file in Path("checkpoints").rglob("*vqgan*.pth")],
+                                          [str(pth_file) for pth_file in Path("checkpoints").rglob("*vqgan*.pth")],
                                   allow_custom_value=True
                                   )
     vqgan_config_name = gr.Dropdown(label="VQGAN 配置文件",
-                                   value="vqgan_pretrain",
-                                   choices=["vqgan_pretrain", "vqgan_finetune"])
+                                    value="vqgan_pretrain",
+                                    choices=["vqgan_pretrain", "vqgan_finetune"])
 
     load_model_btn = gr.Button(value="加载模型", variant="primary")
     error = gr.HTML(label="错误信息")
@@ -260,6 +264,81 @@ def inference(
     content, sr = librosa.load(content, sr=None, mono=True)
 
     return (sr, content), None
+
+
+def wave_header_chunk(frame_input=b"", channels=1, sample_width=2, sample_rate=22050):
+    # copy and paste
+    wav_buf = io.BytesIO()
+    with wave.open(wav_buf, "wb") as vfout:
+        vfout.setnchannels(channels)
+        vfout.setsampwidth(sample_width)
+        vfout.setframerate(sample_rate)
+        vfout.writeframes(frame_input)
+
+    wav_buf.seek(0)
+    return wav_buf.read()
+
+def inference_stream(
+    server_url,
+    text,
+    input_mode,
+    language0,
+    language1,
+    language2,
+    enable_reference_audio,
+    reference_audio,
+    reference_text,
+    max_new_tokens,
+    top_k,
+    top_p,
+    repetition_penalty,
+    temperature,
+    speaker,
+):
+    languages = [language0, language1, language2]
+    languages = [
+        {
+            "中文": "zh",
+            "日文": "jp",
+            "英文": "en",
+        }[language]
+        for language in languages
+    ]
+
+    if len(set(languages)) != len(languages):
+        return []
+
+    order = ",".join(languages)
+    payload = {
+        "text": text,
+        "prompt_text": reference_text if enable_reference_audio else None,
+        "prompt_tokens": reference_audio if enable_reference_audio else None,
+        "max_new_tokens": int(max_new_tokens),
+        "top_k": int(top_k) if top_k > 0 else None,
+        "top_p": top_p,
+        "repetition_penalty": repetition_penalty,
+        "temperature": temperature,
+        "order": order,
+        "use_g2p": input_mode == "自动音素",
+        "seed": None,
+        "speaker": speaker if speaker.strip() != "" else None,
+    }
+
+
+    resp = requests.post(f"{server_url}/v1/models/default/invoke_stream", json=payload, stream=True)
+    resp.raise_for_status()
+
+    yield wave_header_chunk(), None
+
+    for chunk in resp.iter_content(chunk_size=None):
+        if chunk:
+            print("chunk(head): ", chunk[:10])
+            print("chunk(tail): ", chunk[-10:])
+            content = io.BytesIO(chunk)
+            content.seek(0)
+            audio, sr = librosa.load(content, sr=None, mono=True)
+            print(audio, audio.shape, sr)
+            yield (np.concatenate([audio], 0) * 32768).astype(np.int16).tobytes(), None
 
 
 with gr.Blocks(theme=gr.themes.Base()) as app:
@@ -365,18 +444,23 @@ with gr.Blocks(theme=gr.themes.Base()) as app:
                             value="在一无所知中，梦里的一天结束了，一个新的「轮回」便会开始。",
                         )
 
-                with gr.Row():
-                    with gr.Column(scale=2):
-                        generate = gr.Button(value="合成", variant="primary")
-                    with gr.Column(scale=1):
-                        clear = gr.Button(value="清空")
-
         with gr.Column(scale=3):
-            error = gr.HTML(label="错误信息")
-            parsed_text = gr.Dataframe(
-                label="解析结果 (仅参考)", headers=["ID", "文本", "语言", "音素"]
-            )
-            audio = gr.Audio(label="合成音频", type="numpy")
+            with gr.Row():
+                error = gr.HTML(label="错误信息")
+            with gr.Row():
+                parsed_text = gr.Dataframe(
+                    label="解析结果 (仅参考)", headers=["ID", "文本", "语言", "音素"]
+                )
+            with gr.Row():
+                audio_once = gr.Audio(label="一次合成音频", type="numpy")
+            with gr.Row():
+                audio_stream = gr.Audio(label="流式合成音频", autoplay=True, streaming=True, show_label=True, interactive=False)
+            with gr.Row():
+                with gr.Column(scale=2):
+                    generate = gr.Button(value="合成", variant="primary")
+                    stream_generate = gr.Button(value="流式合成", variant="primary")
+                with gr.Column(scale=1):
+                    clear = gr.Button(value="清空")
 
     # Language & Text Parsing
     kwargs = dict(
@@ -419,9 +503,30 @@ with gr.Blocks(theme=gr.themes.Base()) as app:
             temperature,
             speaker,
         ],
-        [audio, error],
+        [audio_once, error],
     )
 
+    stream_generate.click(
+        inference_stream,
+        [
+            server_url,
+            text,
+            input_mode,
+            language0,
+            language1,
+            language2,
+            enable_reference_audio,
+            reference_audio,
+            reference_text,
+            max_new_tokens,
+            top_k,
+            top_p,
+            repetition_penalty,
+            temperature,
+            speaker,
+        ],
+        [audio_stream, error],
+    ).then(lambda: gr.update(interactive=True), None, [text], queue=False)
 
 if __name__ == "__main__":
     app.launch(show_api=False)

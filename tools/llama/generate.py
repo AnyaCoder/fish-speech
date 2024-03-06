@@ -1,7 +1,7 @@
 import os
 import time
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Iterable
 
 import click
 import numpy as np
@@ -199,6 +199,62 @@ def decode_n_tokens(
 
     return previous_tokens[:, : i + 1]
 
+def decode_n_tokens_stream(
+    model: Transformer,
+    cur_token: torch.Tensor,
+    input_pos: torch.Tensor,
+    num_new_tokens: int,
+    eos_token_id: int = 2,
+    segment_length: int = 42,
+    **sampling_kwargs,
+):
+    previous_segment_end = None
+
+    segment_tokens = torch.zeros(
+        (model.config.num_codebooks + 1, segment_length),
+        dtype=torch.int,
+        device=cur_token.device,
+    )
+
+    segment_idx = 0
+    finished = False
+
+    while not finished:
+        win_size = 16
+        for i in range(segment_length):
+            if i < win_size and previous_segment_end is not None:
+                window = torch.cat([previous_segment_end, segment_tokens[:, :i]], dim=1)[:, -win_size:]
+            else:
+                window = segment_tokens[:, max(0, i - win_size):i]
+
+            with torch.backends.cuda.sdp_kernel(
+                    enable_flash=False, enable_mem_efficient=False, enable_math=True
+                ):
+                    next_token = decode_one_token(
+                        model=model,
+                        x=cur_token,
+                        input_pos=input_pos,
+                        previous_tokens=window,
+                        **sampling_kwargs,
+                    )
+
+            input_pos += 1
+            cur_token = next_token.view(1, model.config.num_codebooks + 1, -1)
+            segment_tokens[:, i : i + 1] = next_token.view(
+                model.config.num_codebooks + 1, -1
+            )
+
+            if cur_token[0, 0, -1] == eos_token_id or (cur_token[0, 1:, -1] == 1).any():
+                finished = True
+                yield segment_tokens[:, :i + 1]
+                break
+
+        if not finished:
+            yield segment_tokens
+            segment_tokens = torch.zeros_like(segment_tokens)
+
+        segment_idx += 1
+
 
 @torch.no_grad()
 def generate(
@@ -257,6 +313,67 @@ def generate(
     seq[:, T + 1 :] = x
 
     return seq
+
+@torch.no_grad()
+def generate_stream(
+    *,
+    model: Transformer,
+    prompt: torch.Tensor,
+    max_new_tokens: int,
+    eos_token_id: int = 2,
+    precision: torch.dtype = torch.bfloat16,
+    **sampling_kwargs,
+) -> Iterable[torch.Tensor]:
+    """
+    Takes a conditioning sequence (prompt) as input and continues to generate tokens in a streaming fashion.
+    """
+
+    T = prompt.size(1)
+
+    # Adjust max_new_tokens based on model's max sequence length
+    if max_new_tokens:
+        if T + max_new_tokens > model.config.max_seq_len:
+            max_new_tokens = model.config.max_seq_len - T
+            logger.info(f"Truncating max_new_tokens to {max_new_tokens}")
+        T_new = T + max_new_tokens
+    else:
+        T_new = model.config.max_seq_len
+        max_new_tokens = T_new - T
+
+    device, dtype = prompt.device, prompt.dtype
+
+    # Setup model caches
+    with torch.device(device):
+        model.setup_caches(max_batch_size=1, max_seq_len=T_new, dtype=precision)
+
+    codebook_dim = 1 + model.config.num_codebooks
+
+    # create an empty tensor of the expected final shape and fill in the current tokens
+    empty = torch.empty((codebook_dim, T_new), dtype=dtype, device=device)
+    empty[:, :T] = prompt
+    seq = empty
+    input_pos = torch.arange(0, T, device=device)
+
+    next_token = prefill(
+        model, prompt.view(1, codebook_dim, -1), input_pos, **sampling_kwargs
+    )
+
+    input_pos = torch.tensor([T], device=device, dtype=torch.int)
+
+    for token_segment in decode_n_tokens_stream(
+        model,
+        next_token.view(1, codebook_dim, -1),  # Use the last token of the prompt as the current token
+        input_pos,
+        max_new_tokens - 1,
+        eos_token_id=eos_token_id,
+        **sampling_kwargs,
+    ):
+
+        yield token_segment
+
+        if token_segment[0, -1] == eos_token_id:
+            break
+
 
 
 def encode_tokens(

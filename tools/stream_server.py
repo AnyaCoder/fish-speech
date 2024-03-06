@@ -1,68 +1,32 @@
-import asyncio
-import gc
-import io
-import time
-import traceback
 from http import HTTPStatus
 from threading import Lock
-from typing import Annotated, Literal, Optional
 
 import librosa
 import numpy as np
-import soundfile as sf
 import torch
-import torch.nn.functional as F
+import uvicorn
+from loguru import logger
+from fastapi import FastAPI, HTTPException, Body, Path
+from pydantic import BaseModel
+
+from starlette.responses import StreamingResponse, Response
+import asyncio
+import io
+import soundfile as sf
+import time
 from hydra import compose, initialize
 from hydra.utils import instantiate
-from kui.wsgi import (
-    Body,
-    HTTPException,
-    HttpView,
-    JSONResponse,
-    Kui,
-    OpenAPI,
-    Path,
-    StreamResponse,
-    allow_cors,
-)
-from kui.wsgi.routing import MultimethodRoutes, Router
-from loguru import logger
-from pydantic import BaseModel
 from transformers import AutoTokenizer
 
+from tools.llama.generate import encode_tokens, generate, load_model, generate_stream
+from typing import Annotated, Optional, Dict, Literal
 import tools.llama.generate
 from fish_speech.models.vqgan.utils import sequence_mask
-from tools.llama.generate import encode_tokens, generate, load_model, generate_stream
-from fastapi.responses import Response as StarletteResponse
 
-# Define utils for web server
-def http_execption_handler(exc: HTTPException):
-    return JSONResponse(
-        dict(
-            statusCode=exc.status_code,
-            message=exc.content,
-            error=HTTPStatus(exc.status_code).phrase,
-        ),
-        exc.status_code,
-        exc.headers,
-    )
+import gc
+import torch.nn.functional as F
 
-
-def other_exception_handler(exc: "Exception"):
-    traceback.print_exc()
-
-    status = HTTPStatus.INTERNAL_SERVER_ERROR
-    return JSONResponse(
-        dict(statusCode=status, message=str(exc), error=status.phrase),
-        status,
-    )
-
-
-routes = MultimethodRoutes(base_class=HttpView)
-
-# Define models
-MODELS = {}
-
+app = FastAPI()
 
 class LlamaModel:
     def __init__(
@@ -223,39 +187,49 @@ class VQGANModel:
 
         return indices
 
+class InvokeRequest(BaseModel):
+    text: str = "你说的对, 但是原神是一款由米哈游自主研发的开放世界手游."
+    prompt_text: Optional[str] = None
+    prompt_tokens: Optional[str] = None
+    max_new_tokens: int = 0
+    top_k: Optional[int] = None
+    top_p: float = 0.5
+    repetition_penalty: float = 1.5
+    temperature: float = 0.7
+    order: str = "zh,jp,en"
+    use_g2p: bool = True
+    seed: Optional[int] = None
+    speaker: Optional[str] = None
+
+MODELS ={}
 
 class LoadLlamaModelRequest(BaseModel):
     config_name: str = "text2semantic_finetune"
-    checkpoint_path: str = "checkpoints/text2semantic-400m-v0.2-4k.pth"
+    checkpoint_path: str = "checkpoints/text2semantic-400m-v0.3-4k.pth"
     precision: Literal["float16", "bfloat16"] = "bfloat16"
     tokenizer: str = "fishaudio/speech-lm-v1"
     compile: bool = True
 
-
 class LoadVQGANModelRequest(BaseModel):
     config_name: str = "vqgan_pretrain"
     checkpoint_path: str = "checkpoints/vqgan-v1.pth"
-
 
 class LoadModelRequest(BaseModel):
     device: str = "cuda"
     llama: LoadLlamaModelRequest
     vqgan: LoadVQGANModelRequest
 
-
 class LoadModelResponse(BaseModel):
     name: str
 
-
-@routes.http.put("/models/{name}")
+@app.put("/v1/models/{name}", response_model=LoadModelResponse)
 def api_load_model(
-    name: Annotated[str, Path("default")],
-    req: Annotated[LoadModelRequest, Body(exclusive=True)],
-) -> Annotated[LoadModelResponse, JSONResponse[200, {}, LoadModelResponse]]:
+    name: str = Path(..., title="The name of the model to load"),
+    req: LoadModelRequest = Body(...)
+):
     """
     Load model
     """
-
     if name in MODELS:
         del MODELS[name]
 
@@ -284,60 +258,33 @@ def api_load_model(
 
     return LoadModelResponse(name=name)
 
-
-@routes.http.delete("/models/{name}")
-def api_delete_model(
-    name: Annotated[str, Path("default")],
-) -> JSONResponse[200, {}, dict]:
+@app.delete("/v1/models/{name}")
+async def api_delete_model(name: str = Path(..., title="The name of the model to delete")):
     """
     Delete model
     """
-
     if name not in MODELS:
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST,
-            content="Model not found.",
+            detail="Model not found."
         )
 
     del MODELS[name]
-
-    return JSONResponse(
-        dict(message="Model deleted."),
-        200,
-    )
+    return {"message": "Model deleted."}
 
 
-@routes.http.get("/models")
-def api_list_models() -> JSONResponse[200, {}, dict]:
+@app.get("/v1/models")
+async def api_list_models() -> Dict[str, list]:
     """
     List models
     """
-
-    return JSONResponse(
-        dict(models=list(MODELS.keys())),
-        200,
-    )
+    return {"models": list(MODELS.keys())}
 
 
-class InvokeRequest(BaseModel):
-    text: str = "你说的对, 但是原神是一款由米哈游自主研发的开放世界手游."
-    prompt_text: Optional[str] = None
-    prompt_tokens: Optional[str] = None
-    max_new_tokens: int = 0
-    top_k: Optional[int] = None
-    top_p: float = 0.5
-    repetition_penalty: float = 1.5
-    temperature: float = 0.7
-    order: str = "zh,jp,en"
-    use_g2p: bool = True
-    seed: Optional[int] = None
-    speaker: Optional[str] = None
-
-
-@routes.http.post("/models/{name}/invoke")
-def api_invoke_model(
-    name: Annotated[str, Path("default")],
-    req: Annotated[InvokeRequest, Body(exclusive=True)],
+@app.post("/v1/models/{name}/invoke")
+async def api_invoke_model(
+    name: Annotated[str, Path()],
+    req: Annotated[InvokeRequest, Body()],
 ):
     """
     Invoke model and generate audio
@@ -345,8 +292,8 @@ def api_invoke_model(
 
     if name not in MODELS:
         raise HTTPException(
-            status_code=HTTPStatus.NOT_FOUND,
-            content="Cannot find model.",
+            status_code=HTTPStatus.NOT_FOUND.value,
+            detail="Cannot find model."
         )
 
     model = MODELS[name]
@@ -366,7 +313,7 @@ def api_invoke_model(
         logger.error(f"Unknown prompt tokens: {prompt_tokens}")
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST,
-            content="Unknown prompt tokens, it should be either .npy or .wav file.",
+            detail="Unknown prompt tokens, it should be either .npy or .wav file.",
         )
     else:
         prompt_tokens = None
@@ -432,27 +379,26 @@ def api_invoke_model(
     buffer = io.BytesIO()
     sf.write(buffer, audio, sr, format="wav")
 
-    return StreamResponse(
-        iterable=[buffer.getvalue()],
-        headers={
-            "Content-Disposition": "attachment; filename=audio.wav",
-            "Content-Type": "application/octet-stream",
-        },
-    )
+    headers = {
+        "Content-Disposition": "attachment; filename=audio.wav",
+        "Content-Type": "application/octet-stream",
+    }
+    return Response(content=buffer.getvalue(), headers=headers)
 
-@routes.http.post("/models/{name}/invoke_stream")
+
+@app.post("/v1/models/{name}/invoke_stream")
 async def api_invoke_model_stream(
-    name: Annotated[str, Path("default")],
-    req: Annotated[InvokeRequest, Body(exclusive=True)],
+    name: Annotated[str, Path()],
+    req: Annotated[InvokeRequest, Body()]
 ):
     """
-    Invoke model and generate audio (stream)
-    """
+       Invoke model and generate audio (stream)
+       """
 
     if name not in MODELS:
         raise HTTPException(
-            status_code=HTTPStatus.NOT_FOUND,
-            content="Cannot find model.",
+            status_code=HTTPStatus.NOT_FOUND.value,
+            detail="Cannot find model."
         )
 
     model = MODELS[name]
@@ -472,13 +418,12 @@ async def api_invoke_model_stream(
         logger.error(f"Unknown prompt tokens: {prompt_tokens}")
         raise HTTPException(
             status_code=HTTPStatus.BAD_REQUEST,
-            content="Unknown prompt tokens, it should be either .npy or .wav file.",
+            detail="Unknown prompt tokens, it should be either .npy or .wav file.",
         )
     else:
         prompt_tokens = None
 
     # Lock
-    model["lock"].acquire()
 
     encoded = encode_tokens(
         llama_model_manager.tokenizer,
@@ -499,10 +444,11 @@ async def api_invoke_model_stream(
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
 
-    torch.cuda.synchronize()
-    t0 = time.perf_counter()
-
     async def generate_content():
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+
+        model["lock"].acquire()
 
         token_chunks = generate_stream(
             model=llama_model_manager.model,
@@ -536,28 +482,40 @@ async def api_invoke_model_stream(
 
             codes = token_stream[1:, :]
             codes = codes - 2
+
             # assert (codes >= 0).all(), "Codes should be >= 0"
+
             audio, sr = vqgan_model_manager.sematic_to_wav(codes)
+
 
             buffer = io.BytesIO()
 
             sf.write(buffer, audio, sr, format="wav")
 
             yield buffer.getvalue()
-            await asyncio.sleep(0.1)
+            await asyncio.sleep(0.5)
+
+    headers = {
+        "Content-Disposition": "attachment; filename=audio.wav",
+        "Content-Type": "application/octet-stream",
+    }
+    return StreamingResponse(generate_content(), headers=headers)
+
+async def generate_content():
+    for i in range(10):
+        yield f"Data chunk {i}\n".encode()
+        await asyncio.sleep(1)  # Async pause for 1 second
+
+@app.post("/stream/{name}")
+async def stream_response(
+    name: Annotated[str, Path()]
+):
+    headers = {
+        "Content-Disposition": "attachment; filename=data.txt",
+        "Content-Type": "text/plain",
+    }
+    return StreamingResponse(generate_content(), headers=headers)
 
 
-    return StarletteResponse(generate_content(), media_type="audio/x-wav")
-
-
-# Define Kui app
-app = Kui(
-    exception_handlers={
-        HTTPException: http_execption_handler,
-        Exception: other_exception_handler,
-    },
-    cors_config={},
-)
-
-# Swagger UI & routes
-app.router << ("/v1" // routes) << ("/docs" // OpenAPI().routes)
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8000)
