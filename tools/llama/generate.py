@@ -205,7 +205,7 @@ def decode_n_tokens_stream(
     input_pos: torch.Tensor,
     num_new_tokens: int,
     eos_token_id: int = 2,
-    segment_length: int = 42,
+    segment_length: int = 84,
     **sampling_kwargs,
 ):
     previous_segment_end = None
@@ -221,7 +221,7 @@ def decode_n_tokens_stream(
 
     while not finished:
         win_size = 16
-        for i in range(segment_length):
+        for i in tqdm(range(segment_length)):
             if i < win_size and previous_segment_end is not None:
                 window = torch.cat([previous_segment_end, segment_tokens[:, :i]], dim=1)[:, -win_size:]
             else:

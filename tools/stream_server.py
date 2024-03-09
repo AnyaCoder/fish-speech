@@ -1,3 +1,4 @@
+import pathlib
 from http import HTTPStatus
 from threading import Lock
 
@@ -8,8 +9,7 @@ import uvicorn
 from loguru import logger
 from fastapi import FastAPI, HTTPException, Body, Path
 from pydantic import BaseModel
-
-from starlette.responses import StreamingResponse, Response
+from starlette.responses import StreamingResponse, Response, FileResponse
 import asyncio
 import io
 import soundfile as sf
@@ -222,6 +222,13 @@ class LoadModelRequest(BaseModel):
 class LoadModelResponse(BaseModel):
     name: str
 
+def del_model(name: str):
+    if name in MODELS:
+        del MODELS[name]
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    gc.collect()
+
 @app.put("/v1/models/{name}", response_model=LoadModelResponse)
 def api_load_model(
     name: str = Path(..., title="The name of the model to load"),
@@ -230,8 +237,7 @@ def api_load_model(
     """
     Load model
     """
-    if name in MODELS:
-        del MODELS[name]
+    del_model(name)
 
     llama = req.llama
     vqgan = req.vqgan
@@ -269,7 +275,7 @@ async def api_delete_model(name: str = Path(..., title="The name of the model to
             detail="Model not found."
         )
 
-    del MODELS[name]
+    del_model(name)
     return {"message": "Model deleted."}
 
 
@@ -280,6 +286,13 @@ async def api_list_models() -> Dict[str, list]:
     """
     return {"models": list(MODELS.keys())}
 
+@app.post("/v1/models/{name}/test")
+async def test_endpoint(
+    name: Annotated[str, Path()],
+    request: Annotated[InvokeRequest, Body()]
+):
+    print(name)
+    print(request.text)
 
 @app.post("/v1/models/{name}/invoke")
 async def api_invoke_model(
@@ -379,12 +392,42 @@ async def api_invoke_model(
     buffer = io.BytesIO()
     sf.write(buffer, audio, sr, format="wav")
 
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        gc.collect()
+
     headers = {
         "Content-Disposition": "attachment; filename=audio.wav",
         "Content-Type": "application/octet-stream",
     }
     return Response(content=buffer.getvalue(), headers=headers)
 
+
+buffers = []
+from pydub import AudioSegment
+@app.get("/v1/models/{name}/download")
+async def api_invoke_wav_download(name: str):
+    temp_folder = pathlib.Path(".cache/audio_segments")
+    temp_folder.mkdir(parents=True, exist_ok=True)
+
+    segment_files = []
+    for idx, data in enumerate(buffers):
+        segment_path = temp_folder / f"segment_{idx}.wav"
+        with open(segment_path, "wb") as f:
+            f.write(data)
+        segment_files.append(segment_path)
+
+    combined = AudioSegment.empty()
+    for segment_file in segment_files:
+        segment = AudioSegment.from_wav(segment_file)
+        combined += segment
+    combined_audio_path = temp_folder / "combined_audio.wav"
+    combined.export(combined_audio_path, format="wav")
+
+    for segment_file in segment_files:
+        segment_file.unlink()
+
+    return FileResponse(str(combined_audio_path), media_type='audio/wav', filename=f"{name}.wav")
 
 @app.post("/v1/models/{name}/invoke_stream")
 async def api_invoke_model_stream(
@@ -444,6 +487,7 @@ async def api_invoke_model_stream(
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
 
+    global buffers
     async def generate_content():
         torch.cuda.synchronize()
         t0 = time.perf_counter()
@@ -464,35 +508,23 @@ async def api_invoke_model_stream(
 
         # Release lock
         model["lock"].release()
+        buffers.clear()
 
         for token_stream in token_chunks:
             torch.cuda.synchronize()
-
-            t = time.perf_counter() - t0
-
-            tokens_generated = token_stream.size(1)
-            tokens_sec = tokens_generated / t
-            logger.info(
-                f"Generated {tokens_generated} tokens in {t:.02f} seconds, {tokens_sec:.02f} tokens/sec"
-            )
-            logger.info(
-                f"Bandwidth achieved: {llama_model_manager.model_size * tokens_sec / 1e9:.02f} GB/s"
-            )
-            logger.info(f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB")
 
             codes = token_stream[1:, :]
             codes = codes - 2
 
             # assert (codes >= 0).all(), "Codes should be >= 0"
-
             audio, sr = vqgan_model_manager.sematic_to_wav(codes)
-
-
             buffer = io.BytesIO()
 
             sf.write(buffer, audio, sr, format="wav")
 
             yield buffer.getvalue()
+            buffer.seek(0)
+            buffers.append(buffer.getvalue())
             await asyncio.sleep(0.5)
 
     headers = {
@@ -518,4 +550,4 @@ async def stream_response(
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000)

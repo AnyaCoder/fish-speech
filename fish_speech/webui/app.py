@@ -163,8 +163,8 @@ def build_model_config_block():
     llama_ckpt_path = gr.Dropdown(
         label="Llama 模型路径",
         value=str(Path("checkpoints/text2semantic-400m-v0.3-4k.pth")),
-        choices=[str(pth_file) for pth_file in Path("results").rglob("*text*/*.ckpt")] + \
-                [str(pth_file) for pth_file in Path("checkpoints").rglob("*text*.pth")],
+        choices=[str(pth_file) for pth_file in Path("results").rglob("**/text*/**/*.ckpt")] + \
+                [str(pth_file) for pth_file in Path("checkpoints").rglob("**/*text*.pth")],
         allow_custom_value=True
     )
     llama_config_name = gr.Textbox(label="Llama 配置文件", value="text2semantic_finetune")
@@ -175,8 +175,8 @@ def build_model_config_block():
 
     vqgan_ckpt_path = gr.Dropdown(label="VQGAN 模型路径",
                                   value=str(Path("checkpoints/vqgan-v1.pth")),
-                                  choices=[str(pth_file) for pth_file in Path("results").rglob("*vqgan*/*.ckpt")] + \
-                                          [str(pth_file) for pth_file in Path("checkpoints").rglob("*vqgan*.pth")],
+                                  choices=[str(pth_file) for pth_file in Path("results").rglob("**/vqgan*/**/*.ckpt")] + \
+                                          [str(pth_file) for pth_file in Path("checkpoints").rglob("**/*vqgan*.pth")],
                                   allow_custom_value=True
                                   )
     vqgan_config_name = gr.Dropdown(label="VQGAN 配置文件",
@@ -332,12 +332,10 @@ def inference_stream(
 
     for chunk in resp.iter_content(chunk_size=None):
         if chunk:
-            print("chunk(head): ", chunk[:10])
-            print("chunk(tail): ", chunk[-10:])
             content = io.BytesIO(chunk)
             content.seek(0)
             audio, sr = librosa.load(content, sr=None, mono=True)
-            print(audio, audio.shape, sr)
+            print(audio.shape, sr)
             yield (np.concatenate([audio], 0) * 32768).astype(np.int16).tobytes(), None
 
 
@@ -456,10 +454,11 @@ with gr.Blocks(theme=gr.themes.Base()) as app:
             with gr.Row():
                 audio_stream = gr.Audio(label="流式合成音频", autoplay=True, streaming=True, show_label=True, interactive=False)
             with gr.Row():
-                with gr.Column(scale=2):
-                    generate = gr.Button(value="合成", variant="primary")
-                    stream_generate = gr.Button(value="流式合成", variant="primary")
+                with gr.Column(scale=3):
+                    generate = gr.Button(value="\U0001F3A7 合成", variant="primary")
+                    stream_generate = gr.Button(value="\U0001F4A7 流式合成", variant="primary")
                 with gr.Column(scale=1):
+                    audio_download = gr.Button(value="\U0001F449 下载流式音频", elem_id="audio_download")
                     clear = gr.Button(value="清空")
 
     # Language & Text Parsing
@@ -527,6 +526,17 @@ with gr.Blocks(theme=gr.themes.Base()) as app:
         ],
         [audio_stream, error],
     ).then(lambda: gr.update(interactive=True), None, [text], queue=False)
+
+    audio_download.click(None, js='() => { '
+                              'var btn = document.getElementById("audio_download"); '
+                              'btn.disabled = true; '
+                              'setTimeout(() => { btn.disabled = false; }, 1000); '
+                              'var win = window.open("http://localhost:8000/v1/models/default/download", '
+                              '"newwindow", "height=100, width=400, toolbar=no, menubar=no, scrollbars=no, '
+                                  'resizable=no, location=no, status=no"); '
+                              'setTimeout(function() { win.close(); }, 1000);'
+                              '}')
+
 
 if __name__ == "__main__":
     app.launch(show_api=False)
