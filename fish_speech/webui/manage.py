@@ -97,11 +97,13 @@ def change_label(if_label, path_list=str(Path("data/demo/detect.list").resolve()
         p_label = None
         yield "打标工具WebUI已关闭"
 
-def change_infer(if_infer, host, port):
+def change_infer(if_infer, host, port, backend_host, backend_port):
     global p_infer
     if if_infer == True and p_infer == None:
-        subprocess.Popen([PYTHON, "-m", "zibai", "tools.api_server:app", "--listen", "127.0.0.1:8000"])
         env = os.environ.copy()
+        subprocess.Popen(["uvicorn", "tools.stream_server:app",
+                          "--host", f"{backend_host}", "--port", f"{backend_port}"], env=env)
+
         env["GRADIO_SERVER_NAME"] = host
         env["GRADIO_SERVER_PORT"] = port
         # 启动第二个进程
@@ -468,6 +470,8 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
                         with gr.Accordion(label="\U0001F5A5 推理服务器配置", open=False):
                             infer_host_textbox = gr.Textbox(label="Webui启动服务器地址", value="127.0.0.1")
                             infer_port_textbox = gr.Textbox(label="Webui启动服务器端口", value="7862")
+                            backend_host_textbox = gr.Textbox(label="后端启动服务器地址", value="127.0.0.1")
+                            backend_port_textbox = gr.Textbox(label="后端启动服务器端口", value="8000")
                     with gr.Row():
                         infer_checkbox = gr.Checkbox(label="是否打开推理界面")
                         infer_error = gr.HTML(label="推理界面错误信息")
@@ -520,6 +524,8 @@ with gr.Blocks(head="<style>\n" + css + "\n</style>", js=js,
                                     llama_limit_val_batches_slider,
                                     llama_precision_dropdown, llama_every_n_steps_slider],
                             outputs=[llama_error])
-    infer_checkbox.change(fn=change_infer, inputs=[infer_checkbox, infer_host_textbox, infer_port_textbox], outputs=[infer_error])
+    infer_checkbox.change(fn=change_infer, inputs=[infer_checkbox, infer_host_textbox, infer_port_textbox,
+                                                   backend_host_textbox, backend_port_textbox],
+                          outputs=[infer_error])
 
 demo.launch(inbrowser=True)
