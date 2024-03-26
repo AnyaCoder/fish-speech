@@ -21,3 +21,4 @@ ffmpeg.exe
 /.cache
 /PortableGit
 /vits
+/LLVM-17.0.6-win64.exe
