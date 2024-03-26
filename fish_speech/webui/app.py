@@ -156,7 +156,8 @@ def build_model_config_block():
             )
         with gr.Column(scale=1):
             compile_model = gr.Checkbox(
-                label="编译模型",
+                label="编译模型 (N卡专用的加速, 目前成功的有: RTX 4060 Laptop，第一次启动会慢一些)",
+                info="感谢 吃土佬 提供的支持",
                 value=True,
             )
 
