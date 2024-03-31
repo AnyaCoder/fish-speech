@@ -328,8 +328,8 @@ def train_process(data_path: str, option: str):
                         "--config", "fish_speech/configs/data/finetune.yaml",
                         "--filelist", str(default_filelist),
                         "--output", "data/quantized-dataset-ft.protos", "--num-workers", "16"])
-        if sys.platform == 'linux':
-            subprocess.Popen(["data_server/target/release/data_server", "--files", "data/quantized-dataset-ft.protos"])
+        # if sys.platform == 'linux':
+        #     subprocess.Popen(["data_server/target/release/data_server", "--files", "data/quantized-dataset-ft.protos"])
 
         subprocess.run([PYTHON, "fish_speech/train.py",
                         "--config-name", "text2semantic_finetune"])
