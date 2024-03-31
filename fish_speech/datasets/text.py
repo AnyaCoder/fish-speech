@@ -194,7 +194,7 @@ class AutoAugTextDataset(IterableDataset):
         max_length: int = 1024,
         tokenizer: AutoTokenizer = None,
         use_speaker: bool = True,
-        use_data_server: bool = False if sys.platform == "win32" else True,
+        use_data_server: bool = False,
         proto_files: list = ["data/quantized-dataset-ft.protos"],
         causual: bool = True,
         mix_text_phone_prob: float = 0.5,
