@@ -101,7 +101,7 @@ def change_infer(if_infer, host, port, backend_host, backend_port):
     global p_infer
     if if_infer == True and p_infer == None:
         env = os.environ.copy()
-        subprocess.Popen(["uvicorn", "tools.stream_server:app",
+        subprocess.Popen([PYTHON, "-m", "uvicorn", "tools.stream_server:app",
                           "--host", f"{backend_host}", "--port", f"{backend_port}"], env=env)
 
         env["GRADIO_SERVER_NAME"] = host
