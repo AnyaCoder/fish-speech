@@ -18,6 +18,9 @@ filelists
 /data
 /.idea
 ffmpeg.exe
-asr-label-win-x64.exe
+ffprobe.exe
+asr-label*
 /.cache
 /fishenv
+/.locale
+/demo-audios

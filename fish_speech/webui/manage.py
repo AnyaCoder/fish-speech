@@ -8,7 +8,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import webbrowser
 from pathlib import Path
 
 import gradio as gr
@@ -17,16 +16,19 @@ import yaml
 from loguru import logger
 from tqdm import tqdm
 
-from fish_speech.webui.launch_utils import Seafoam, versions_html
-
 PYTHON = os.path.join(os.environ.get("PYTHON_FOLDERPATH", ""), "python")
 sys.path.insert(0, "")
 print(sys.path)
 cur_work_dir = Path(os.getcwd()).resolve()
 print("You are in ", str(cur_work_dir))
+
+from fish_speech.i18n import i18n
+from fish_speech.webui.launch_utils import Seafoam, is_module_installed, versions_html
+
 config_path = cur_work_dir / "fish_speech" / "configs"
 vqgan_yml_path = config_path / "vqgan_finetune.yaml"
 llama_yml_path = config_path / "text2semantic_finetune.yaml"
+vits_yml_path = config_path / "vits_decoder_finetune.yaml"
 
 env = os.environ.copy()
 env["no_proxy"] = "127.0.0.1, localhost, 0.0.0.0"
@@ -47,6 +49,15 @@ def build_html_ok_message(msg):
     <div style="color: green; font-weight: bold;">
         {html.escape(msg)}
     </div>
+    """
+
+
+def build_html_href(link, desc, msg):
+    return f"""
+    <span style="color: green; font-weight: bold; display: inline-block">
+        {html.escape(msg)}
+        <a href="{link}">{desc}</a>
+    </span>
     """
 
 
@@ -93,21 +104,76 @@ def kill_process(pid):
 
 def change_label(if_label):
     global p_label
-    if if_label == True:
-        # 设置要访问的URL
-        url = "https://text-labeler.pages.dev/"
-        webbrowser.open(url)
-        yield f"已打开网址"
-    elif if_label == False:
+    if if_label == True and p_label is None:
+        url = "http://localhost:3000"
+        remote_url = "https://text-labeler.pages.dev/"
+        try:
+            p_label = subprocess.Popen(
+                [
+                    (
+                        "asr-label-linux-x64"
+                        if sys.platform == "linux"
+                        else "asr-label-win-x64.exe"
+                    )
+                ]
+            )
+        except FileNotFoundError:
+            logger.warning("asr-label execution not found!")
+
+        yield build_html_href(
+            link=remote_url,
+            desc=i18n("Optional online ver"),
+            msg=i18n("Opened labeler in browser"),
+        )
+
+    elif if_label == False and p_label is not None:
+        kill_process(p_label.pid)
         p_label = None
-        yield "Nothing"
+        yield build_html_ok_message("Nothing")
+
+
+def change_decoder_config(decoder_model_path):
+    if "vits" in decoder_model_path:
+        choices = ["vits_decoder_finetune", "vits_decoder_pretrain"]
+        return gr.Dropdown(choices=choices, value=choices[0])
+    elif "vqgan" in decoder_model_path or "vq-gan" in decoder_model_path:
+        choices = ["vqgan_finetune", "vqgan_pretrain"]
+        return gr.Dropdown(choices=choices, value=choices[0])
+    else:
+        raise ValueError("Invalid decoder name")
+
+
+def change_llama_config(llama_model_path):
+    if "large" in llama_model_path:
+        return gr.Dropdown(value="dual_ar_2_codebook_large", interactive=False)
+    elif "medium" in llama_model_path:
+        return gr.Dropdown(value="dual_ar_2_codebook_medium", interactive=False)
+    else:
+        raise ValueError("Invalid model size")
+
+
+def clean_infer_cache():
+    import tempfile
+
+    temp_dir = Path(tempfile.gettempdir())
+    gradio_dir = str(temp_dir / "gradio")
+    try:
+        shutil.rmtree(gradio_dir)
+        logger.info(f"Deleted cached audios: {gradio_dir}")
+    except PermissionError:
+        logger.info(f"Permission denied: Unable to delete {gradio_dir}")
+    except FileNotFoundError:
+        logger.info(f"{gradio_dir} was not found")
+    except Exception as e:
+        logger.info(f"An error occurred: {e}")
 
 
 def change_infer(
     if_infer,
     host,
     port,
-    infer_vqgan_model,
+    infer_decoder_model,
+    infer_decoder_config,
     infer_llama_model,
     infer_llama_config,
     infer_compile,
@@ -119,13 +185,21 @@ def change_infer(
         env["GRADIO_SERVER_NAME"] = host
         env["GRADIO_SERVER_PORT"] = port
         # 启动第二个进程
-        yield build_html_ok_message(f"推理界面已开启, 访问 http://{host}:{port}")
+        url = f"http://{host}:{port}"
+        yield build_html_ok_message(
+            i18n("Inferring interface is launched at {}").format(url)
+        )
+
+        clean_infer_cache()
+
         p_infer = subprocess.Popen(
             [
                 PYTHON,
                 "tools/webui.py",
-                "--vqgan-checkpoint-path",
-                infer_vqgan_model,
+                "--decoder-checkpoint-path",
+                infer_decoder_model,
+                "--decoder-config-name",
+                infer_decoder_config,
                 "--llama-checkpoint-path",
                 infer_llama_model,
                 "--llama-config-name",
@@ -137,10 +211,10 @@ def change_infer(
             env=env,
         )
 
-    elif if_infer == False and p_infer != None:
+    elif if_infer == False and p_infer is not None:
         kill_process(p_infer.pid)
         p_infer = None
-        yield build_html_error_message("推理界面已关闭")
+        yield build_html_error_message(i18n("Infer interface is closed"))
 
 
 js = load_data_in_raw("fish_speech/webui/js/animate.js")
@@ -216,12 +290,14 @@ def add_item(folder: str, method: str, label_lang: str):
         elif folder:
             err = folder
             return gr.Checkboxgroup(choices=items), build_html_error_message(
-                f"添加文件夹路径无效: {err}"
+                i18n("Invalid path: {}").format(err)
             )
 
     formatted_data = json.dumps(dict_items, ensure_ascii=False, indent=4)
     logger.info(formatted_data)
-    return gr.Checkboxgroup(choices=items), build_html_ok_message("添加文件(夹)路径成功!")
+    return gr.Checkboxgroup(choices=items), build_html_ok_message(
+        i18n("Added path successfully!")
+    )
 
 
 def remove_items(selected_items):
@@ -233,13 +309,28 @@ def remove_items(selected_items):
     formatted_data = json.dumps(dict_items, ensure_ascii=False, indent=4)
     logger.info(formatted_data)
     return gr.Checkboxgroup(choices=items, value=[]), build_html_ok_message(
-        "删除文件(夹)路径成功!"
+        i18n("Removed path successfully!")
     )
 
 
 def show_selected(options):
     selected_options = ", ".join(options)
-    return f"你选中了: {selected_options}" if options else "你没有选中任何选项"
+
+    if options:
+        return i18n("Selected: {}").format(selected_options)
+    else:
+        return i18n("No selected options")
+
+
+from pydub import AudioSegment
+
+
+def convert_to_mono_in_place(audio_path: Path):
+    audio = AudioSegment.from_file(audio_path)
+    if audio.channels > 1:
+        mono_audio = audio.set_channels(1)
+        mono_audio.export(audio_path, format=audio_path.suffix[1:])
+        logger.info(f"Convert {audio_path} successfully")
 
 
 def list_copy(list_file_path, method):
@@ -256,11 +347,11 @@ def list_copy(list_file_path, method):
             if target_wav_path.is_file():
                 continue
             target_wav_path.parent.mkdir(parents=True, exist_ok=True)
-            if method == "复制一份":
+            if method == i18n("Copy"):
                 shutil.copy(original_wav_path, target_wav_path)
             else:
                 shutil.move(original_wav_path, target_wav_path.parent)
-
+            convert_to_mono_in_place(target_wav_path)
             original_lab_path = original_wav_path.with_suffix(".lab")
             target_lab_path = (
                 wav_root
@@ -269,22 +360,20 @@ def list_copy(list_file_path, method):
             )
             if target_lab_path.is_file():
                 continue
-            if method == "复制一份":
+            if method == i18n("Copy"):
                 shutil.copy(original_lab_path, target_lab_path)
             else:
                 shutil.move(original_lab_path, target_lab_path.parent)
 
-    if method == "直接移动":
+    if method == i18n("Move"):
         with list_file_path.open("w", encoding="utf-8") as file:
             file.writelines("\n".join(lst))
 
     del lst
-    return build_html_ok_message("使用filelist")
+    return build_html_ok_message(i18n("Use filelist"))
 
 
 def check_files(data_path: str, max_depth: int, label_model: str, label_device: str):
-    dict_to_language = {"中文": "ZH", "英文": "EN", "日文": "JP", "不打标": "WTF"}
-
     global dict_items
     data_path = Path(data_path)
     for item, content in dict_items.items():
@@ -292,8 +381,20 @@ def check_files(data_path: str, max_depth: int, label_model: str, label_device: 
         tar_path = data_path / item_path.name
 
         if content["type"] == "folder" and item_path.is_dir():
-            cur_lang = dict_to_language[content["label_lang"]]
-            if cur_lang != "WTF":
+            if content["method"] == i18n("Copy"):
+                os.makedirs(tar_path, exist_ok=True)
+                shutil.copytree(
+                    src=str(item_path), dst=str(tar_path), dirs_exist_ok=True
+                )
+            elif not tar_path.is_dir():
+                shutil.move(src=str(item_path), dst=str(tar_path))
+
+            for suf in ["wav", "flac", "mp3"]:
+                for audio_path in tar_path.glob(f"**/*.{suf}"):
+                    convert_to_mono_in_place(audio_path)
+
+            cur_lang = content["label_lang"]
+            if cur_lang != "IGNORE":
                 try:
                     subprocess.run(
                         [
@@ -304,9 +405,9 @@ def check_files(data_path: str, max_depth: int, label_model: str, label_device: 
                             "--device",
                             label_device,
                             "--audio-dir",
-                            item_path,
+                            tar_path,
                             "--save-dir",
-                            item_path,
+                            tar_path,
                             "--language",
                             cur_lang,
                         ],
@@ -315,24 +416,21 @@ def check_files(data_path: str, max_depth: int, label_model: str, label_device: 
                 except Exception:
                     print("Transcription error occurred")
 
-            if content["method"] == "复制一份":
-                os.makedirs(tar_path, exist_ok=True)
-                shutil.copytree(
-                    src=str(item_path), dst=str(tar_path), dirs_exist_ok=True
-                )
-            elif not tar_path.is_dir():
-                shutil.move(src=str(item_path), dst=str(tar_path))
-
         elif content["type"] == "file" and item_path.is_file():
             list_copy(item_path, content["method"])
 
-    return build_html_ok_message("文件移动完毕"), new_explorer(data_path, max_depth=max_depth)
+    return build_html_ok_message(i18n("Move files successfully")), new_explorer(
+        data_path, max_depth=max_depth
+    )
 
 
 def train_process(
     data_path: str,
     option: str,
+    min_duration: float,
+    max_duration: float,
     # vq-gan config
+    vqgan_ckpt,
     vqgan_lr,
     vqgan_maxsteps,
     vqgan_data_num_workers,
@@ -340,7 +438,17 @@ def train_process(
     vqgan_data_val_batch_size,
     vqgan_precision,
     vqgan_check_interval,
+    # vits config
+    vits_ckpt,
+    vits_lr,
+    vits_maxsteps,
+    vits_data_num_workers,
+    vits_data_batch_size,
+    vits_data_val_batch_size,
+    vits_precision,
+    vits_check_interval,
     # llama config
+    llama_ckpt,
     llama_base_config,
     llama_lr,
     llama_maxsteps,
@@ -366,20 +474,51 @@ def train_process(
 
     print("New Project Name: ", new_project)
 
-    if option == "VQGAN" or option == "all":
+    if min_duration > max_duration:
+        min_duration, max_duration = max_duration, min_duration
+
+    if option == "VQGAN" or option == "VITS":
         subprocess.run(
             [
                 PYTHON,
                 "tools/vqgan/create_train_split.py",
                 str(data_pre_output.relative_to(cur_work_dir)),
+                "--min-duration",
+                str(min_duration),
+                "--max-duration",
+                str(max_duration),
             ]
         )
+
+    if option == "VQGAN":
+        latest = next(
+            iter(
+                sorted(
+                    [
+                        str(p.relative_to("results"))
+                        for p in Path("results").glob("vqgan_*/")
+                    ],
+                    reverse=True,
+                )
+            ),
+            ("vqgan_" + new_project),
+        )
+        project = (
+            ("vqgan_" + new_project)
+            if vqgan_ckpt == i18n("new")
+            else (
+                latest
+                if vqgan_ckpt == i18n("latest")
+                else Path(vqgan_ckpt).relative_to("results")
+            )
+        )
+        logger.info(project)
         train_cmd = [
             PYTHON,
             "fish_speech/train.py",
             "--config-name",
             "vqgan_finetune",
-            f"project={'vqgan_' + new_project}",
+            f"project={project}",
             f"trainer.strategy.process_group_backend={backend}",
             f"model.optimizer.lr={vqgan_lr}",
             f"trainer.max_steps={vqgan_maxsteps}",
@@ -394,7 +533,53 @@ def train_process(
         logger.info(train_cmd)
         subprocess.run(train_cmd)
 
-    if option == "LLAMA" or option == "all":
+    if option == "VITS":
+        latest = next(
+            iter(
+                sorted(
+                    [
+                        str(p.relative_to("results"))
+                        for p in Path("results").glob("vits_*/")
+                    ],
+                    reverse=True,
+                )
+            ),
+            ("vits_" + new_project),
+        )
+        project = (
+            ("vits_" + new_project)
+            if vits_ckpt == i18n("new")
+            else (
+                latest
+                if vits_ckpt == i18n("latest")
+                else Path(vits_ckpt).relative_to("results")
+            )
+        )
+        ckpt_path = str(Path("checkpoints/vits_decoder_v1.1.ckpt"))
+        logger.info(project)
+        train_cmd = [
+            PYTHON,
+            "fish_speech/train.py",
+            "--config-name",
+            "vits_decoder_finetune",
+            f"project={project}",
+            f"ckpt_path={ckpt_path}",
+            f"trainer.strategy.process_group_backend={backend}",
+            "tokenizer.pretrained_model_name_or_path=checkpoints",
+            f"model.optimizer.lr={vits_lr}",
+            f"trainer.max_steps={vits_maxsteps}",
+            f"data.num_workers={vits_data_num_workers}",
+            f"data.batch_size={vits_data_batch_size}",
+            f"data.val_batch_size={vits_data_val_batch_size}",
+            f"trainer.precision={vits_precision}",
+            f"trainer.val_check_interval={vits_check_interval}",
+            f"train_dataset.filelist={str(data_pre_output / 'vq_train_filelist.txt')}",
+            f"val_dataset.filelist={str(data_pre_output / 'vq_val_filelist.txt')}",
+        ]
+        logger.info(train_cmd)
+        subprocess.run(train_cmd)
+
+    if option == "LLAMA":
         subprocess.run(
             [
                 PYTHON,
@@ -424,16 +609,41 @@ def train_process(
             ]
         )
         ckpt_path = (
-            "text2semantic-pretrain-medium-2k-v1.pth"
+            "text2semantic-sft-medium-v1.1-4k.pth"
             if llama_base_config == "dual_ar_2_codebook_medium"
-            else "text2semantic-sft-large-v1-4k.pth"
+            else "text2semantic-sft-large-v1.1-4k.pth"
         )
+        lora_prefix = "lora_" if llama_use_lora else ""
+        llama_size = "large_" if ("large" in llama_base_config) else "medium_"
+        llama_name = lora_prefix + "text2semantic_" + llama_size + new_project
+        latest = next(
+            iter(
+                sorted(
+                    [
+                        str(p.relative_to("results"))
+                        for p in Path("results").glob(lora_prefix + "text2sem*/")
+                    ],
+                    reverse=True,
+                )
+            ),
+            llama_name,
+        )
+        project = (
+            llama_name
+            if llama_ckpt == i18n("new")
+            else (
+                latest
+                if llama_ckpt == i18n("latest")
+                else Path(llama_ckpt).relative_to("results")
+            )
+        )
+        logger.info(project)
         train_cmd = [
             PYTHON,
             "fish_speech/train.py",
             "--config-name",
             "text2semantic_finetune",
-            f"project={'text2semantic_' + new_project}",
+            f"project={project}",
             f"ckpt_path=checkpoints/{ckpt_path}",
             f"trainer.strategy.process_group_backend={backend}",
             f"model@model.model={llama_base_config}",
@@ -453,7 +663,7 @@ def train_process(
         logger.info(train_cmd)
         subprocess.run(train_cmd)
 
-    return build_html_ok_message("训练终止")
+    return build_html_ok_message(i18n("Training stopped"))
 
 
 def tensorboard_process(
@@ -464,13 +674,17 @@ def tensorboard_process(
 ):
     global p_tensorboard
     if if_tensorboard == True and p_tensorboard == None:
-        yield build_html_ok_message(f"Tensorboard界面已开启, 访问 http://{host}:{port}")
+        url = f"http://{host}:{port}"
+        yield build_html_ok_message(
+            i18n("Tensorboard interface is launched at {}").format(url)
+        )
+        prefix = ["tensorboard"]
+        if Path("fishenv").exists():
+            prefix = ["fishenv/env/python.exe", "fishenv/env/Scripts/tensorboard.exe"]
+
         p_tensorboard = subprocess.Popen(
-            [
-                "fishenv/python.exe",
-                "fishenv/Scripts/tensorboard.exe"
-                if Path("fishenv").exists()
-                else "tensorboard",
+            prefix
+            + [
                 "--logdir",
                 tensorboard_dir,
                 "--host",
@@ -484,42 +698,98 @@ def tensorboard_process(
     elif if_tensorboard == False and p_tensorboard != None:
         kill_process(p_tensorboard.pid)
         p_tensorboard = None
-        yield build_html_error_message("Tensorboard界面已关闭")
+        yield build_html_error_message(i18n("Tensorboard interface is closed"))
 
 
 def fresh_tb_dir():
     return gr.Dropdown(
-        choices=[str(p) for p in Path("results").glob("**/tensorboard/version_*/")]
+        choices=[str(p) for p in Path("results").glob("**/tensorboard/")]
     )
 
 
-def fresh_vqgan_model():
-    return gr.Dropdown(
-        choices=[init_vqgan_yml["ckpt_path"]]
+def list_decoder_models():
+    paths = (
+        [str(p) for p in Path("checkpoints").glob("vits*.*")]
+        + [str(p) for p in Path("checkpoints").glob("vq*.*")]
         + [str(p) for p in Path("results").glob("vqgan*/**/*.ckpt")]
+        + [str(p) for p in Path("results").glob("vits*/**/*.ckpt")]
+    )
+    if not paths:
+        logger.warning("No decoder model found")
+    return paths
+
+
+def list_llama_models():
+    choices = [
+        str(p).replace("\\", "/") for p in Path("checkpoints").glob("text2sem*.*")
+    ]
+    choices += [str(p) for p in Path("results").glob("text2sem*/**/*.ckpt")]
+    if not choices:
+        logger.warning("No LLaMA model found")
+    return choices
+
+
+def list_lora_llama_models():
+    choices = [str(p) for p in Path("results").glob("lora*/**/*.ckpt")]
+    if not choices:
+        logger.warning("No LoRA LLaMA model found")
+    return choices
+
+
+def fresh_decoder_model():
+    return gr.Dropdown(choices=list_decoder_models())
+
+
+def fresh_vqgan_ckpt():
+    return gr.Dropdown(
+        choices=[i18n("latest"), i18n("new")]
+        + [str(p) for p in Path("results").glob("vqgan_*/")]
+    )
+
+
+def fresh_vits_ckpt():
+    return gr.Dropdown(
+        choices=[i18n("latest"), i18n("new")]
+        + [str(p) for p in Path("results").glob("vits_*/")]
+    )
+
+
+def fresh_llama_ckpt(llama_use_lora):
+    return gr.Dropdown(
+        choices=[i18n("latest"), i18n("new")]
+        + (
+            [str(p) for p in Path("results").glob("text2sem*/")]
+            if not llama_use_lora
+            else [str(p) for p in Path("results").glob("lora_*/")]
+        )
     )
 
 
 def fresh_llama_model():
-    return gr.Dropdown(
-        choices=[init_llama_yml["ckpt_path"]]
-        + [str(p) for p in Path("results").glob("text2sem*/**/*.ckpt")]
-    )
+    choices = [
+        str(p).replace("\\", "/") for p in Path("checkpoints").glob("text2sem*.*")
+    ]
+    choices += [str(p) for p in Path("results").glob("text2sem*/**/*.ckpt")]
+    return gr.Dropdown(choices=choices)
 
 
-def llama_lora_merge(llama_weight, lora_weight, llama_lora_output):
+def llama_lora_merge(llama_weight, lora_llama_config, lora_weight, llama_lora_output):
     if (
         lora_weight is None
         or not Path(lora_weight).exists()
         or not Path(llama_weight).exists()
     ):
-        return build_html_error_message("路径错误，请检查模型文件是否存在于对应路径")
+        return build_html_error_message(
+            i18n(
+                "Path error, please check the model file exists in the corresponding path"
+            )
+        )
 
     merge_cmd = [
         PYTHON,
         "tools/llama/merge_lora.py",
         "--llama-config",
-        "dual_ar_2_codebook_large",
+        lora_llama_config,
         "--lora-config",
         "r_8_alpha_16",
         "--llama-weight",
@@ -531,366 +801,565 @@ def llama_lora_merge(llama_weight, lora_weight, llama_lora_output):
     ]
     logger.info(merge_cmd)
     subprocess.run(merge_cmd)
-    return build_html_ok_message("融合终止")
+    return build_html_ok_message(i18n("Merge successfully"))
 
 
 init_vqgan_yml = load_yaml_data_in_fact(vqgan_yml_path)
 init_llama_yml = load_yaml_data_in_fact(llama_yml_path)
+init_vits_yml = load_yaml_data_in_fact(vits_yml_path)
 
 with gr.Blocks(
     head="<style>\n" + css + "\n</style>",
     js=js,
     theme=seafoam,
     analytics_enabled=False,
-    title="Fish-Speech 鱼语",
+    title="Fish Speech",
 ) as demo:
     with gr.Row():
         with gr.Column():
-            with gr.Tab("\U0001F4D6 数据集准备"):
+            with gr.Tab("\U0001F4D6 " + i18n("Data Preprocessing")):
                 with gr.Row():
                     textbox = gr.Textbox(
-                        label="\U0000270F 输入音频&转写源文件夹路径",
-                        info="音频装在一个以说话人命名的文件夹内作为区分",
+                        label="\U0000270F "
+                        + i18n("Input Audio & Source Path for Transcription"),
+                        info=i18n("Speaker is identified by the folder name"),
                         interactive=True,
                     )
                 with gr.Row(equal_height=False):
                     with gr.Column():
                         output_radio = gr.Radio(
-                            label="\U0001F4C1 选择源文件(夹)处理方式",
-                            choices=["复制一份", "直接移动"],
-                            value="复制一份",
+                            label="\U0001F4C1 "
+                            + i18n("Select source file processing method"),
+                            choices=[i18n("Copy"), i18n("Move")],
+                            value=i18n("Copy"),
                             interactive=True,
                         )
                     with gr.Column():
-                        error = gr.HTML(label="错误信息")
+                        error = gr.HTML(label=i18n("Error Message"))
                         if_label = gr.Checkbox(
-                            label="是否开启打标WebUI", scale=0, show_label=True
+                            label=i18n("Open Labeler WebUI"), scale=0, show_label=True
                         )
                 with gr.Row():
-                    add_button = gr.Button("\U000027A1提交到处理区", variant="primary")
-                    remove_button = gr.Button("\U000026D4 取消所选内容")
+                    min_duration = gr.Slider(
+                        label=i18n("Minimum Audio Duration"),
+                        value=1.5,
+                        step=0.1,
+                        minimum=0.4,
+                        maximum=30,
+                    )
+                    max_duration = gr.Slider(
+                        label=i18n("Maximum Audio Duration"),
+                        value=30,
+                        step=0.1,
+                        minimum=0.4,
+                        maximum=30,
+                    )
+
+                with gr.Row():
+                    add_button = gr.Button(
+                        "\U000027A1 " + i18n("Add to Processing Area"),
+                        variant="primary",
+                    )
+                    remove_button = gr.Button(
+                        "\U000026D4 " + i18n("Remove Selected Data")
+                    )
 
                 with gr.Row():
                     label_device = gr.Dropdown(
-                        label="打标设备",
-                        info="建议使用cuda, 实在是低配置再用cpu",
+                        label=i18n("Labeling Device"),
+                        info=i18n(
+                            "It is recommended to use CUDA, if you have low configuration, use CPU"
+                        ),
                         choices=["cpu", "cuda"],
                         value="cuda",
                         interactive=True,
                     )
                     label_model = gr.Dropdown(
-                        label="打标模型大小",
-                        info="显存10G以上用large, 5G用medium, 2G用small",
+                        label=i18n("Whisper Model"),
+                        info=i18n(
+                            "Use large for 10G+ GPU, medium for 5G, small for 2G"
+                        ),
                         choices=["large", "medium", "small"],
                         value="small",
                         interactive=True,
                     )
                     label_radio = gr.Dropdown(
-                        label="(可选)打标语言",
-                        info="如果没有音频对应的文本，则进行辅助打标, 支持.txt或.lab格式",
-                        choices=["中文", "日文", "英文", "不打标"],
-                        value="不打标",
+                        label=i18n("Optional Label Language"),
+                        info=i18n(
+                            "If there is no corresponding text for the audio, apply ASR for assistance, support .txt or .lab format"
+                        ),
+                        choices=[
+                            (i18n("Chinese"), "ZH"),
+                            (i18n("English"), "EN"),
+                            (i18n("Japanese"), "JA"),
+                            (i18n("Disabled"), "IGNORE"),
+                        ],
+                        value="IGNORE",
                         interactive=True,
                     )
 
-            with gr.Tab("\U0001F6E0 训练配置项"):  # hammer
+            with gr.Tab("\U0001F6E0 " + i18n("Training Configuration")):
                 with gr.Row():
                     model_type_radio = gr.Radio(
-                        label="选择要训练的模型类型",
-                        interactive=True,
-                        choices=["VQGAN", "LLAMA", "all"],
-                        value="all",
+                        label=i18n(
+                            "Select the model to be trained (Depending on the Tab page you are on)"
+                        ),
+                        interactive=False,
+                        choices=["VQGAN", "VITS", "LLAMA"],
+                        value="VQGAN",
                     )
                 with gr.Row():
-                    with gr.Tab(label="VQGAN配置项"):
-                        with gr.Row(equal_height=False):
-                            vqgan_lr_slider = gr.Slider(
-                                label="初始学习率",
-                                interactive=True,
-                                minimum=1e-5,
-                                maximum=1e-4,
-                                step=1e-5,
-                                value=init_vqgan_yml["model"]["optimizer"]["lr"],
-                            )
-                            vqgan_maxsteps_slider = gr.Slider(
-                                label="训练最大步数",
-                                interactive=True,
-                                minimum=1000,
-                                maximum=100000,
-                                step=1000,
-                                value=init_vqgan_yml["trainer"]["max_steps"],
-                            )
-
-                        with gr.Row(equal_height=False):
-                            vqgan_data_num_workers_slider = gr.Slider(
-                                label="num_workers",
-                                interactive=True,
-                                minimum=1,
-                                maximum=16,
-                                step=1,
-                                value=init_vqgan_yml["data"]["num_workers"],
-                            )
-
-                            vqgan_data_batch_size_slider = gr.Slider(
-                                label="batch_size",
-                                interactive=True,
-                                minimum=1,
-                                maximum=32,
-                                step=1,
-                                value=init_vqgan_yml["data"]["batch_size"],
-                            )
-                        with gr.Row(equal_height=False):
-                            vqgan_data_val_batch_size_slider = gr.Slider(
-                                label="val_batch_size",
-                                interactive=True,
-                                minimum=1,
-                                maximum=32,
-                                step=1,
-                                value=init_vqgan_yml["data"]["val_batch_size"],
-                            )
-                            vqgan_precision_dropdown = gr.Dropdown(
-                                label="训练精度",
-                                interactive=True,
-                                choices=["32", "bf16-true", "bf16-mixed"],
-                                value=str(init_vqgan_yml["trainer"]["precision"]),
-                            )
-                        with gr.Row(equal_height=False):
-                            vqgan_check_interval_slider = gr.Slider(
-                                label="每n步保存一个模型",
-                                interactive=True,
-                                minimum=500,
-                                maximum=10000,
-                                step=500,
-                                value=init_vqgan_yml["trainer"]["val_check_interval"],
-                            )
-
-                    with gr.Tab(label="LLAMA配置项"):
-                        with gr.Row(equal_height=False):
-                            llama_use_lora = gr.Checkbox(
-                                label="使用lora训练？",
-                                value=True,
-                            )
-                        with gr.Row(equal_height=False):
-                            llama_lr_slider = gr.Slider(
-                                label="初始学习率",
-                                interactive=True,
-                                minimum=1e-5,
-                                maximum=1e-4,
-                                step=1e-5,
-                                value=init_llama_yml["model"]["optimizer"]["lr"],
-                            )
-                            llama_maxsteps_slider = gr.Slider(
-                                label="训练最大步数",
-                                interactive=True,
-                                minimum=1000,
-                                maximum=100000,
-                                step=1000,
-                                value=init_llama_yml["trainer"]["max_steps"],
-                            )
-                        with gr.Row(equal_height=False):
-                            llama_base_config = gr.Dropdown(
-                                label="模型基础属性",
-                                choices=[
-                                    "dual_ar_2_codebook_large",
-                                    "dual_ar_2_codebook_medium",
-                                ],
-                                value="dual_ar_2_codebook_large",
-                            )
-                            llama_data_num_workers_slider = gr.Slider(
-                                label="num_workers",
-                                minimum=0,
-                                maximum=16,
-                                step=1,
-                                value=init_llama_yml["data"]["num_workers"]
-                                if sys.platform == "linux"
-                                else 0,
-                            )
-                        with gr.Row(equal_height=False):
-                            llama_data_batch_size_slider = gr.Slider(
-                                label="batch_size",
-                                interactive=True,
-                                minimum=1,
-                                maximum=32,
-                                step=1,
-                                value=init_llama_yml["data"]["batch_size"],
-                            )
-                            llama_data_max_length_slider = gr.Slider(
-                                label="max_length",
-                                interactive=True,
-                                minimum=1024,
-                                maximum=4096,
-                                step=128,
-                                value=init_llama_yml["max_length"],
-                            )
-                        with gr.Row(equal_height=False):
-                            llama_precision_dropdown = gr.Dropdown(
-                                label="训练精度",
-                                interactive=True,
-                                choices=["32", "bf16-true", "16-mixed"],
-                                value="bf16-true",
-                            )
-                            llama_check_interval_slider = gr.Slider(
-                                label="每n步保存一个模型",
-                                interactive=True,
-                                minimum=500,
-                                maximum=10000,
-                                step=500,
-                                value=init_llama_yml["trainer"]["val_check_interval"],
-                            )
-                        with gr.Row(equal_height=False):
-                            llama_grad_batches = gr.Slider(
-                                label="accumulate_grad_batches",
-                                interactive=True,
-                                minimum=1,
-                                maximum=20,
-                                step=1,
-                                value=init_llama_yml["trainer"][
-                                    "accumulate_grad_batches"
-                                ],
-                            )
-                            llama_use_speaker = gr.Slider(
-                                label="use_speaker_ratio",
-                                interactive=True,
-                                minimum=0.1,
-                                maximum=1.0,
-                                step=0.05,
-                                value=init_llama_yml["train_dataset"]["use_speaker"],
-                            )
-
-                    with gr.Tab(label="LLAMA_lora融合"):
-                        with gr.Row(equal_height=False):
-                            llama_weight = gr.Dropdown(
-                                label="要融入的原模型",
-                                info="输入路径，或者下拉选择",
-                                choices=[init_llama_yml["ckpt_path"]],
-                                value=init_llama_yml["ckpt_path"],
-                                allow_custom_value=True,
-                                interactive=True,
-                            )
-                        with gr.Row(equal_height=False):
-                            lora_weight = gr.Dropdown(
-                                label="要融入的lora模型",
-                                info="输入路径，或者下拉选择",
-                                choices=[
-                                    str(p)
-                                    for p in Path("results").glob("text2*ar/**/*.ckpt")
-                                ],
-                                allow_custom_value=True,
-                                interactive=True,
-                            )
-                        with gr.Row(equal_height=False):
-                            llama_lora_output = gr.Dropdown(
-                                label="输出的lora模型",
-                                info="输出路径",
-                                value="checkpoints/merged.ckpt",
-                                choices=["checkpoints/merged.ckpt"],
-                                allow_custom_value=True,
-                                interactive=True,
-                            )
-                        with gr.Row(equal_height=False):
-                            llama_lora_merge_btn = gr.Button(
-                                value="开始融合", variant="primary"
-                            )
-
-                    with gr.Tab(label="Tensorboard"):
-                        with gr.Row(equal_height=False):
-                            tb_host = gr.Textbox(
-                                label="Tensorboard Host", value="127.0.0.1"
-                            )
-                            tb_port = gr.Textbox(
-                                label="Tensorboard Port", value="11451"
-                            )
-                        with gr.Row(equal_height=False):
-                            tb_dir = gr.Dropdown(
-                                label="Tensorboard 日志文件夹",
-                                allow_custom_value=True,
-                                choices=[
-                                    str(p)
-                                    for p in Path("results").glob(
-                                        "**/tensorboard/version_*/"
-                                    )
-                                ],
-                            )
-                        with gr.Row(equal_height=False):
-                            if_tb = gr.Checkbox(
-                                label="是否打开tensorboard?",
-                            )
-
-            with gr.Tab("\U0001F9E0 进入推理界面"):
-                with gr.Column():
-                    with gr.Row():
-                        with gr.Accordion(label="\U0001F5A5 推理服务器配置", open=False):
-                            with gr.Row():
-                                infer_host_textbox = gr.Textbox(
-                                    label="Webui启动服务器地址", value="127.0.0.1"
+                    with gr.Tabs():
+                        with gr.Tab(label=i18n("VQGAN Configuration")) as vqgan_page:
+                            with gr.Row(equal_height=False):
+                                vqgan_ckpt = gr.Dropdown(
+                                    label=i18n("Select VQGAN ckpt"),
+                                    choices=[i18n("latest"), i18n("new")]
+                                    + [
+                                        str(p) for p in Path("results").glob("vqgan_*/")
+                                    ],
+                                    value=i18n("latest"),
+                                    interactive=True,
                                 )
-                                infer_port_textbox = gr.Textbox(
-                                    label="Webui启动服务器端口", value="7862"
+                            with gr.Row(equal_height=False):
+                                vqgan_lr_slider = gr.Slider(
+                                    label=i18n("Initial Learning Rate"),
+                                    interactive=True,
+                                    minimum=1e-5,
+                                    maximum=1e-4,
+                                    step=1e-5,
+                                    value=init_vqgan_yml["model"]["optimizer"]["lr"],
                                 )
-                            with gr.Row():
-                                infer_vqgan_model = gr.Dropdown(
-                                    label="VQGAN模型位置",
-                                    info="填写pth/ckpt文件路径",
-                                    value=init_vqgan_yml["ckpt_path"],
-                                    choices=[init_vqgan_yml["ckpt_path"]]
+                                vqgan_maxsteps_slider = gr.Slider(
+                                    label=i18n("Maximum Training Steps"),
+                                    interactive=True,
+                                    minimum=1000,
+                                    maximum=100000,
+                                    step=1000,
+                                    value=init_vqgan_yml["trainer"]["max_steps"],
+                                )
+
+                            with gr.Row(equal_height=False):
+                                vqgan_data_num_workers_slider = gr.Slider(
+                                    label=i18n("Number of Workers"),
+                                    interactive=True,
+                                    minimum=1,
+                                    maximum=16,
+                                    step=1,
+                                    value=init_vqgan_yml["data"]["num_workers"],
+                                )
+
+                                vqgan_data_batch_size_slider = gr.Slider(
+                                    label=i18n("Batch Size"),
+                                    interactive=True,
+                                    minimum=1,
+                                    maximum=32,
+                                    step=1,
+                                    value=init_vqgan_yml["data"]["batch_size"],
+                                )
+                            with gr.Row(equal_height=False):
+                                vqgan_data_val_batch_size_slider = gr.Slider(
+                                    label=i18n("Validation Batch Size"),
+                                    interactive=True,
+                                    minimum=1,
+                                    maximum=32,
+                                    step=1,
+                                    value=init_vqgan_yml["data"]["val_batch_size"],
+                                )
+                                vqgan_precision_dropdown = gr.Dropdown(
+                                    label=i18n("Precision"),
+                                    interactive=True,
+                                    choices=["32", "bf16-true", "bf16-mixed"],
+                                    info=i18n(
+                                        "bf16-true is recommended for 30+ series GPU, 16-mixed is recommended for 10+ series GPU"
+                                    ),
+                                    value=str(init_vqgan_yml["trainer"]["precision"]),
+                                )
+                            with gr.Row(equal_height=False):
+                                vqgan_check_interval_slider = gr.Slider(
+                                    label=i18n("Save model every n steps"),
+                                    interactive=True,
+                                    minimum=500,
+                                    maximum=10000,
+                                    step=500,
+                                    value=init_vqgan_yml["trainer"][
+                                        "val_check_interval"
+                                    ],
+                                )
+
+                        with gr.Tab(label=i18n("VITS Configuration")) as vits_page:
+                            with gr.Row(equal_height=False):
+                                vits_ckpt = gr.Dropdown(
+                                    label=i18n("Select VITS ckpt"),
+                                    choices=[i18n("latest"), i18n("new")]
+                                    + [str(p) for p in Path("results").glob("vits_*/")],
+                                    value=i18n("latest"),
+                                    interactive=True,
+                                )
+                            with gr.Row(equal_height=False):
+                                vits_lr_slider = gr.Slider(
+                                    label=i18n("Initial Learning Rate"),
+                                    interactive=True,
+                                    minimum=1e-5,
+                                    maximum=1e-4,
+                                    step=1e-5,
+                                    value=init_vits_yml["model"]["optimizer"]["lr"],
+                                )
+                                vits_maxsteps_slider = gr.Slider(
+                                    label=i18n("Maximum Training Steps"),
+                                    interactive=True,
+                                    minimum=1000,
+                                    maximum=100000,
+                                    step=1000,
+                                    value=init_vits_yml["trainer"]["max_steps"],
+                                )
+
+                            with gr.Row(equal_height=False):
+                                vits_data_num_workers_slider = gr.Slider(
+                                    label=i18n("Number of Workers"),
+                                    interactive=True,
+                                    minimum=1,
+                                    maximum=16,
+                                    step=1,
+                                    value=init_vits_yml["data"]["num_workers"],
+                                )
+
+                                vits_data_batch_size_slider = gr.Slider(
+                                    label=i18n("Batch Size"),
+                                    interactive=True,
+                                    minimum=1,
+                                    maximum=32,
+                                    step=1,
+                                    value=init_vits_yml["data"]["batch_size"],
+                                )
+                            with gr.Row(equal_height=False):
+                                vits_data_val_batch_size_slider = gr.Slider(
+                                    label=i18n("Validation Batch Size"),
+                                    interactive=True,
+                                    minimum=1,
+                                    maximum=32,
+                                    step=1,
+                                    value=init_vits_yml["data"]["val_batch_size"],
+                                )
+                                vits_precision_dropdown = gr.Dropdown(
+                                    label=i18n("Precision"),
+                                    interactive=True,
+                                    choices=["32", "bf16-mixed"],
+                                    info=i18n(
+                                        "16-mixed is recommended for 10+ series GPU"
+                                    ),
+                                    value=str(init_vits_yml["trainer"]["precision"]),
+                                )
+                            with gr.Row(equal_height=False):
+                                vits_check_interval_slider = gr.Slider(
+                                    label=i18n("Save model every n steps"),
+                                    interactive=True,
+                                    minimum=1,
+                                    maximum=2000,
+                                    step=1,
+                                    value=init_vits_yml["trainer"][
+                                        "val_check_interval"
+                                    ],
+                                )
+
+                        with gr.Tab(
+                            label=i18n("LLAMA Configuration"), id=3
+                        ) as llama_page:
+                            with gr.Row(equal_height=False):
+                                llama_use_lora = gr.Checkbox(
+                                    label=i18n("Use LoRA"),
+                                    info=i18n(
+                                        "Use LoRA can save GPU memory, but may reduce the quality of the model"
+                                    ),
+                                    value=True,
+                                )
+                                llama_ckpt = gr.Dropdown(
+                                    label=i18n("Select LLAMA ckpt"),
+                                    choices=[i18n("latest"), i18n("new")]
                                     + [
                                         str(p)
-                                        for p in Path("results").glob(
-                                            "vqgan*/**/*.ckpt"
-                                        )
+                                        for p in Path("results").glob("text2sem*/")
+                                    ]
+                                    + [str(p) for p in Path("results").glob("lora*/")],
+                                    value=i18n("latest"),
+                                    interactive=True,
+                                )
+                            with gr.Row(equal_height=False):
+                                llama_lr_slider = gr.Slider(
+                                    label=i18n("Initial Learning Rate"),
+                                    interactive=True,
+                                    minimum=1e-5,
+                                    maximum=1e-4,
+                                    step=1e-5,
+                                    value=init_llama_yml["model"]["optimizer"]["lr"],
+                                )
+                                llama_maxsteps_slider = gr.Slider(
+                                    label=i18n("Maximum Training Steps"),
+                                    interactive=True,
+                                    minimum=50,
+                                    maximum=10000,
+                                    step=50,
+                                    value=init_llama_yml["trainer"]["max_steps"],
+                                )
+                            with gr.Row(equal_height=False):
+                                llama_base_config = gr.Dropdown(
+                                    label=i18n("Model Size"),
+                                    choices=[
+                                        "dual_ar_2_codebook_large",
+                                        "dual_ar_2_codebook_medium",
+                                    ],
+                                    value="dual_ar_2_codebook_medium",
+                                )
+                                llama_data_num_workers_slider = gr.Slider(
+                                    label=i18n("Number of Workers"),
+                                    minimum=1,
+                                    maximum=16,
+                                    step=1,
+                                    value=(
+                                        init_llama_yml["data"]["num_workers"]
+                                        if sys.platform == "linux"
+                                        else 1
+                                    ),
+                                )
+                            with gr.Row(equal_height=False):
+                                llama_data_batch_size_slider = gr.Slider(
+                                    label=i18n("Batch Size"),
+                                    interactive=True,
+                                    minimum=1,
+                                    maximum=32,
+                                    step=1,
+                                    value=init_llama_yml["data"]["batch_size"],
+                                )
+                                llama_data_max_length_slider = gr.Slider(
+                                    label=i18n("Maximum Length per Sample"),
+                                    interactive=True,
+                                    minimum=1024,
+                                    maximum=4096,
+                                    step=128,
+                                    value=init_llama_yml["max_length"],
+                                )
+                            with gr.Row(equal_height=False):
+                                llama_precision_dropdown = gr.Dropdown(
+                                    label=i18n("Precision"),
+                                    info=i18n(
+                                        "bf16-true is recommended for 30+ series GPU, 16-mixed is recommended for 10+ series GPU"
+                                    ),
+                                    interactive=True,
+                                    choices=["32", "bf16-true", "16-mixed"],
+                                    value="bf16-true",
+                                )
+                                llama_check_interval_slider = gr.Slider(
+                                    label=i18n("Save model every n steps"),
+                                    interactive=True,
+                                    minimum=50,
+                                    maximum=1000,
+                                    step=50,
+                                    value=init_llama_yml["trainer"][
+                                        "val_check_interval"
+                                    ],
+                                )
+                            with gr.Row(equal_height=False):
+                                llama_grad_batches = gr.Slider(
+                                    label=i18n("Accumulate Gradient Batches"),
+                                    interactive=True,
+                                    minimum=1,
+                                    maximum=20,
+                                    step=1,
+                                    value=init_llama_yml["trainer"][
+                                        "accumulate_grad_batches"
+                                    ],
+                                )
+                                llama_use_speaker = gr.Slider(
+                                    label=i18n(
+                                        "Probability of applying Speaker Condition"
+                                    ),
+                                    interactive=True,
+                                    minimum=0.1,
+                                    maximum=1.0,
+                                    step=0.05,
+                                    value=init_llama_yml["train_dataset"][
+                                        "use_speaker"
+                                    ],
+                                )
+
+                        with gr.Tab(label=i18n("Merge LoRA"), id=4):
+                            with gr.Row(equal_height=False):
+                                llama_weight = gr.Dropdown(
+                                    label=i18n("Base LLAMA Model"),
+                                    info=i18n(
+                                        "Type the path or select from the dropdown"
+                                    ),
+                                    choices=[
+                                        "checkpoints/text2semantic-sft-large-v1.1-4k.pth",
+                                        "checkpoints/text2semantic-sft-medium-v1.1-4k.pth",
+                                    ],
+                                    value=init_llama_yml["ckpt_path"],
+                                    allow_custom_value=True,
+                                    interactive=True,
+                                )
+                            with gr.Row(equal_height=False):
+                                lora_weight = gr.Dropdown(
+                                    label=i18n("LoRA Model to be merged"),
+                                    info=i18n(
+                                        "Type the path or select from the dropdown"
+                                    ),
+                                    choices=[
+                                        str(p)
+                                        for p in Path("results").glob("lora*/**/*.ckpt")
+                                    ],
+                                    allow_custom_value=True,
+                                    interactive=True,
+                                )
+                                lora_llama_config = gr.Dropdown(
+                                    label=i18n("LLAMA Model Config"),
+                                    info=i18n(
+                                        "Type the path or select from the dropdown"
+                                    ),
+                                    choices=[
+                                        "dual_ar_2_codebook_large",
+                                        "dual_ar_2_codebook_medium",
+                                    ],
+                                    value="dual_ar_2_codebook_medium",
+                                    allow_custom_value=True,
+                                )
+                            with gr.Row(equal_height=False):
+                                llama_lora_output = gr.Dropdown(
+                                    label=i18n("Output Path"),
+                                    info=i18n(
+                                        "Type the path or select from the dropdown"
+                                    ),
+                                    value="checkpoints/merged.ckpt",
+                                    choices=["checkpoints/merged.ckpt"],
+                                    allow_custom_value=True,
+                                    interactive=True,
+                                )
+                            with gr.Row(equal_height=False):
+                                llama_lora_merge_btn = gr.Button(
+                                    value=i18n("Merge"), variant="primary"
+                                )
+
+                        with gr.Tab(label="Tensorboard", id=5):
+                            with gr.Row(equal_height=False):
+                                tb_host = gr.Textbox(
+                                    label=i18n("Tensorboard Host"), value="127.0.0.1"
+                                )
+                                tb_port = gr.Textbox(
+                                    label=i18n("Tensorboard Port"), value="11451"
+                                )
+                            with gr.Row(equal_height=False):
+                                tb_dir = gr.Dropdown(
+                                    label=i18n("Tensorboard Log Path"),
+                                    allow_custom_value=True,
+                                    choices=[
+                                        str(p)
+                                        for p in Path("results").glob("**/tensorboard/")
+                                    ],
+                                )
+                            with gr.Row(equal_height=False):
+                                if_tb = gr.Checkbox(
+                                    label=i18n("Open Tensorboard"),
+                                )
+
+            with gr.Tab("\U0001F9E0 " + i18n("Inference Configuration")):
+                with gr.Column():
+                    with gr.Row():
+                        with gr.Accordion(
+                            label="\U0001F5A5 "
+                            + i18n("Inference Server Configuration"),
+                            open=False,
+                        ):
+                            with gr.Row():
+                                infer_host_textbox = gr.Textbox(
+                                    label=i18n("WebUI Host"), value="127.0.0.1"
+                                )
+                                infer_port_textbox = gr.Textbox(
+                                    label=i18n("WebUI Port"), value="7862"
+                                )
+                            with gr.Row():
+                                infer_decoder_model = gr.Dropdown(
+                                    label=i18n("Decoder Model Path"),
+                                    info=i18n(
+                                        "Type the path or select from the dropdown"
+                                    ),
+                                    choices=list_decoder_models(),
+                                    value=init_vits_yml["ckpt_path"],
+                                    allow_custom_value=True,
+                                )
+                                infer_decoder_config = gr.Dropdown(
+                                    label=i18n("Decoder Model Config"),
+                                    info=i18n("Changing with the Model Path"),
+                                    value="vits_decoder_finetune",
+                                    choices=[
+                                        "vits_decoder_finetune",
+                                        "vits_decoder_pretrain",
+                                        "vqgan_finetune",
+                                        "vqgan_pretrain",
                                     ],
                                     allow_custom_value=True,
                                 )
                             with gr.Row():
                                 infer_llama_model = gr.Dropdown(
-                                    label="LLAMA模型位置",
-                                    info="填写pth/ckpt文件路径",
+                                    label=i18n("LLAMA Model Path"),
+                                    info=i18n(
+                                        "Type the path or select from the dropdown"
+                                    ),
                                     value=init_llama_yml["ckpt_path"],
-                                    choices=[init_llama_yml["ckpt_path"]]
-                                    + [
-                                        str(p)
-                                        for p in Path("results").glob(
-                                            "text2sem*/**/*.ckpt"
-                                        )
-                                    ],
+                                    choices=list_llama_models(),
                                     allow_custom_value=True,
                                 )
-                            with gr.Row():
-                                infer_compile = gr.Radio(
-                                    label="是否编译模型？", choices=["Yes", "No"], value="Yes"
-                                )
                                 infer_llama_config = gr.Dropdown(
-                                    label="LLAMA模型基础属性",
+                                    label=i18n("LLAMA Model Config"),
+                                    info=i18n("Changing with the Model Path"),
                                     choices=[
                                         "dual_ar_2_codebook_large",
                                         "dual_ar_2_codebook_medium",
                                     ],
-                                    value="dual_ar_2_codebook_large",
+                                    value="dual_ar_2_codebook_medium",
                                     allow_custom_value=True,
+                                )
+                            with gr.Row():
+                                infer_compile = gr.Radio(
+                                    label=i18n("Compile Model"),
+                                    info=i18n(
+                                        "Compile the model can significantly reduce the inference time, but will increase cold start time"
+                                    ),
+                                    choices=["Yes", "No"],
+                                    value=(
+                                        "Yes" if (sys.platform == "linux") else "No"
+                                    ),
+                                    interactive=is_module_installed("triton"),
                                 )
 
                     with gr.Row():
-                        infer_checkbox = gr.Checkbox(label="是否打开推理界面")
-                        infer_error = gr.HTML(label="推理界面错误信息")
+                        infer_checkbox = gr.Checkbox(
+                            label=i18n("Open Inference Server")
+                        )
+                        infer_error = gr.HTML(label=i18n("Inference Server Error"))
 
         with gr.Column():
-            train_error = gr.HTML(label="训练时的报错信息")
+            train_error = gr.HTML(label=i18n("Training Error"))
             checkbox_group = gr.CheckboxGroup(
-                label="\U0001F4CA 数据源列表",
-                info="左侧输入文件夹所在路径或filelist。无论是否勾选，在此列表中都会被用以后续训练。",
+                label="\U0001F4CA " + i18n("Data Source"),
+                info=i18n(
+                    "The path of the input folder on the left or the filelist. Whether checked or not, it will be used for subsequent training in this list."
+                ),
                 elem_classes=["data_src"],
             )
             train_box = gr.Textbox(
-                label="数据预处理文件夹路径", value=str(data_pre_output), interactive=False
+                label=i18n("Data Preprocessing Path"),
+                value=str(data_pre_output),
+                interactive=False,
             )
             model_box = gr.Textbox(
-                label="\U0001F4BE 模型输出路径",
+                label="\U0001F4BE " + i18n("Model Output Path"),
                 value=str(default_model_output),
                 interactive=False,
             )
 
             with gr.Accordion(
-                "查看预处理文件夹状态 (滑块为显示深度大小)",
+                i18n(
+                    "View the status of the preprocessing folder (use the slider to control the depth of the tree)"
+                ),
                 elem_classes=["scrollable-component"],
                 elem_id="file_accordion",
             ):
@@ -905,11 +1374,12 @@ with gr.Blocks(
                 file_markdown = new_explorer(str(data_pre_output), 0)
             with gr.Row(equal_height=False):
                 admit_btn = gr.Button(
-                    "\U00002705 文件预处理", scale=0, min_width=160, variant="primary"
+                    "\U00002705 " + i18n("File Preprocessing"),
+                    variant="primary",
                 )
                 fresh_btn = gr.Button("\U0001F503", scale=0, min_width=80)
                 help_button = gr.Button("\U00002753", scale=0, min_width=80)  # question
-                train_btn = gr.Button("训练启动!", variant="primary")
+                train_btn = gr.Button(i18n("Start Training"), variant="primary")
 
     footer = load_data_in_raw("fish_speech/webui/html/footer.html")
     footer = footer.format(
@@ -917,7 +1387,9 @@ with gr.Blocks(
         api_docs="https://speech.fish.audio/inference/#http-api",
     )
     gr.HTML(footer, elem_id="footer")
-
+    vqgan_page.select(lambda: "VQGAN", None, model_type_radio)
+    vits_page.select(lambda: "VITS", None, model_type_radio)
+    llama_page.select(lambda: "LLAMA", None, model_type_radio)
     add_button.click(
         fn=add_item,
         inputs=[textbox, output_radio, label_radio],
@@ -933,12 +1405,16 @@ with gr.Blocks(
         'toolbar=no, menubar=no, scrollbars=no, resizable=no, location=no, status=no")}',
     )
     if_label.change(fn=change_label, inputs=[if_label], outputs=[error])
+
     train_btn.click(
         fn=train_process,
         inputs=[
             train_box,
             model_type_radio,
+            min_duration,
+            max_duration,
             # vq-gan config
+            vqgan_ckpt,
             vqgan_lr_slider,
             vqgan_maxsteps_slider,
             vqgan_data_num_workers_slider,
@@ -946,7 +1422,17 @@ with gr.Blocks(
             vqgan_data_val_batch_size_slider,
             vqgan_precision_dropdown,
             vqgan_check_interval_slider,
+            # vits config
+            vits_ckpt,
+            vits_lr_slider,
+            vits_maxsteps_slider,
+            vits_data_num_workers_slider,
+            vits_data_batch_size_slider,
+            vits_data_val_batch_size_slider,
+            vits_precision_dropdown,
+            vits_check_interval_slider,
             # llama config
+            llama_ckpt,
             llama_base_config,
             llama_lr_slider,
             llama_maxsteps_slider,
@@ -967,8 +1453,16 @@ with gr.Blocks(
         outputs=[train_error],
     )
     tb_dir.change(fn=fresh_tb_dir, inputs=[], outputs=[tb_dir])
-    infer_vqgan_model.change(
-        fn=fresh_vqgan_model, inputs=[], outputs=[infer_vqgan_model]
+    infer_decoder_model.change(
+        fn=change_decoder_config,
+        inputs=[infer_decoder_model],
+        outputs=[infer_decoder_config],
+    )
+    infer_llama_model.change(
+        fn=change_llama_config, inputs=[infer_llama_model], outputs=[infer_llama_config]
+    )
+    infer_decoder_model.change(
+        fn=fresh_decoder_model, inputs=[], outputs=[infer_decoder_model]
     )
     infer_llama_model.change(
         fn=fresh_llama_model, inputs=[], outputs=[infer_llama_model]
@@ -982,9 +1476,25 @@ with gr.Blocks(
     fresh_btn.click(
         fn=new_explorer, inputs=[train_box, tree_slider], outputs=[file_markdown]
     )
+    vqgan_ckpt.change(fn=fresh_vqgan_ckpt, inputs=[], outputs=[vqgan_ckpt])
+    vits_ckpt.change(fn=fresh_vits_ckpt, inputs=[], outputs=[vits_ckpt])
+    llama_use_lora.change(
+        fn=fresh_llama_ckpt, inputs=[llama_use_lora], outputs=[llama_ckpt]
+    )
+    llama_ckpt.change(
+        fn=fresh_llama_ckpt, inputs=[llama_use_lora], outputs=[llama_ckpt]
+    )
+    lora_weight.change(
+        fn=change_llama_config, inputs=[lora_weight], outputs=[lora_llama_config]
+    )
+    lora_weight.change(
+        fn=lambda: gr.Dropdown(choices=list_lora_llama_models()),
+        inputs=[],
+        outputs=[lora_weight],
+    )
     llama_lora_merge_btn.click(
         fn=llama_lora_merge,
-        inputs=[llama_weight, lora_weight, llama_lora_output],
+        inputs=[llama_weight, lora_llama_config, lora_weight, llama_lora_output],
         outputs=[train_error],
     )
     infer_checkbox.change(
@@ -993,7 +1503,8 @@ with gr.Blocks(
             infer_checkbox,
             infer_host_textbox,
             infer_port_textbox,
-            infer_vqgan_model,
+            infer_decoder_model,
+            infer_decoder_config,
             infer_llama_model,
             infer_llama_config,
             infer_compile,

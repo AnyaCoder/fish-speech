@@ -5,14 +5,14 @@ defaults:
 
 project: text2semantic_finetune_dual_ar
 max_length: 2048
-ckpt_path: checkpoints/text2semantic-sft-large-v1-4k.pth
+ckpt_path: checkpoints/text2semantic-sft-medium-v1.1-4k.pth
 resume_weights_only: true
 
 # Lightning Trainer
 trainer:
   accumulate_grad_batches: 1
   gradient_clip_val: 1.0
-  gradient_clip_algorithm: 'norm'
+  gradient_clip_algorithm: "norm"
   max_steps: 1000
   precision: bf16-true
   limit_val_batches: 10
@@ -72,10 +72,10 @@ model:
     lr_lambda:
       _target_: fish_speech.scheduler.get_cosine_schedule_with_warmup_lr_lambda
       _partial_: true
-      num_warmup_steps: 100
+      num_warmup_steps: 0.1
       num_training_steps: ${trainer.max_steps}
 
 # Callbacks
 callbacks:
   model_checkpoint:
-    every_n_train_steps: 100
+    every_n_train_steps: ${trainer.val_check_interval}
