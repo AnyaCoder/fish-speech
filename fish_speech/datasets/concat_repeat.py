@@ -1,4 +1,5 @@
 import bisect
+import random
 from typing import Iterable
 
 from torch.utils.data import Dataset, IterableDataset
@@ -32,7 +33,7 @@ class ConcatRepeatDataset(Dataset):
         for d in self.datasets:
             assert not isinstance(
                 d, IterableDataset
-            ), "ConcatDataset does not support IterableDataset"
+            ), "ConcatRepeatDataset does not support IterableDataset"
 
         self.cumulative_sizes = self.cumsum(self.datasets, self.repeats)
 

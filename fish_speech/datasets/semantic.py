@@ -16,6 +16,7 @@ from torch.distributed import get_rank, get_world_size, is_initialized
 from torch.utils.data import DataLoader, IterableDataset, get_worker_info
 from transformers import AutoTokenizer
 
+from fish_speech.conversation import CODEBOOK_PAD_TOKEN_ID
 from fish_speech.datasets.protos.text_data_pb2 import SampledData
 from fish_speech.datasets.protos.text_data_stream import read_pb_stream
 from fish_speech.text.clean import clean_text
@@ -23,10 +24,6 @@ from fish_speech.utils import RankedLogger
 from fish_speech.utils.braceexpand import braceexpand
 
 log = RankedLogger(__name__, rank_zero_only=True)
-
-CODEBOOK_PAD_TOKEN_ID = 0
-CODEBOOK_EOS_TOKEN_ID = 1
-SKIP_TEXT_STRING = "<|skip_text|>"
 
 
 def split_by_rank_worker(files):
@@ -56,108 +53,7 @@ def split_by_rank_worker(files):
     return files
 
 
-class StreamTextDataset(IterableDataset):
-    def __init__(
-        self,
-        files: Optional[Union[list[str], str]] = None,
-        prefix: Optional[str] = None,
-        seed: int = 42,
-        parquet_batch_size: int = 10000,
-        repo: str = "uonlp/CulturaX",
-        max_length: int = 1024,
-        tokenizer: AutoTokenizer = None,
-    ):
-        super().__init__()
-
-        self.seed = seed
-        self.parquet_batch_size = parquet_batch_size
-        self.repo = repo
-        self.max_length = max_length
-        self.tokenizer = tokenizer
-
-        if files is None and prefix is None:
-            raise ValueError("Either files or prefix must be specified")
-
-        if prefix is not None:
-            files = HfApi().list_repo_files(repo, repo_type="dataset")
-            files = [
-                f for f in files if f.startswith(prefix) and f.endswith(".parquet")
-            ]
-            log.info(f"Found {len(files)} files in {repo} with prefix {prefix}")
-        else:
-            if isinstance(files, str):
-                files = [files]
-
-            files = list(chain.from_iterable(map(braceexpand, files)))
-            log.info(f"Expanded {len(files)} files in {repo}")
-
-        # Get sharded files
-        self.files = sorted(files)
-        Random(seed).shuffle(self.files)
-
-    def __iter__(self):
-        files = split_by_rank_worker(self.files)
-        random.shuffle(files)
-
-        for filename in files:
-            try:
-                yield from self.parse_data(filename)
-            except Exception as e:
-                log.exception(f"Failed to parse {filename}: {e}")
-
-    def parse_data(self, filename: str):
-        for data in self.parse_data_internal(filename):
-            text = data["text"]
-
-            # encode
-            tokens = self.tokenizer.encode(
-                text,
-                add_special_tokens=False,
-                truncation=False,
-                max_length=10**6,
-            )
-
-            # Random choice self.max_length
-            if len(tokens) > self.max_length:
-                start = random.randint(0, len(tokens) - self.max_length)
-                tokens = tokens[start : start + self.max_length - 1]
-
-            tokens = (
-                [self.tokenizer.bos_token_id] + tokens + [self.tokenizer.eos_token_id]
-            )
-            # Pad dims
-            placeholder_multi_codebook = torch.zeros((4, len(tokens)), dtype=torch.long)
-
-            tokens = torch.concat(
-                [
-                    torch.tensor([tokens], dtype=torch.long),
-                    placeholder_multi_codebook,
-                ],
-                dim=0,
-            )
-            labels = tokens.clone()
-            tokens = tokens[:, :-1]
-            labels = labels[:, 1:]
-            labels[1:] = -100  # remove all placeholders
-
-            yield {"tokens": tokens, "labels": labels}
-
-    def parse_data_internal(self, filename: str):
-        url = f"https://huggingface.co/datasets/{self.repo}/resolve/main/{filename}"
-
-        with xopen(url, mode="rb") as stream:
-            parquet_file = pq.ParquetFile(stream)
-
-            for batch in parquet_file.iter_batches(
-                batch_size=self.parquet_batch_size, columns=["text"]
-            ):
-                # In-batch shuffling
-                texts = [{"text": text.as_py()} for text in batch["text"]]
-                random.shuffle(texts)
-                yield from texts
-
-
-class AutoAugTextDataset(IterableDataset):
+class AutoTextSemanticInstructionDataset(IterableDataset):
     """
     Auto Augment Dataset by Speaker
 
@@ -179,8 +75,7 @@ class AutoAugTextDataset(IterableDataset):
         max_length: int = 1024,
         tokenizer: AutoTokenizer = None,
         use_speaker: bool | float = True,
-        causual: bool = True,
-        use_negative_samples: bool = False,
+        causal: bool = True,
         num_codebooks: Optional[int] = None,
         skip_text_prob: float = 0.0,
     ):
@@ -192,8 +87,7 @@ class AutoAugTextDataset(IterableDataset):
             max_length: max length of the text
             tokenizer: tokenizer
             use_speaker: include speaker information in the prompt
-            causual: use causual sampling when using local data, disable will lead to random sampling
-            use_negative_samples: generate negative samples
+            causal: use causal sampling when using local data, disable will lead to random sampling
             num_codebooks: number of codebooks, if None, it will be automatically detected
             skip_text_prob: probability to skip the text (audio only), this only applies to interactive mode
         """
@@ -208,8 +102,7 @@ class AutoAugTextDataset(IterableDataset):
         self.interactive_prob = interactive_prob
         self.use_speaker = use_speaker
         self.proto_files = proto_files
-        self.causual = causual
-        self.use_negative_samples = use_negative_samples
+        self.causal = causal
         self.num_codebooks = num_codebooks
         self.skip_text_prob = skip_text_prob
 
@@ -279,7 +172,7 @@ class AutoAugTextDataset(IterableDataset):
         # choice group based on their number of samples
         group = random.choices(self.groups, weights=self.group_weights, k=1)[0]
 
-        if self.causual:
+        if self.causal:
             # Sample in order
             if num_samples >= len(group.sentences):
                 samples = group.sentences
@@ -346,7 +239,6 @@ class AutoAugTextDataset(IterableDataset):
                     sentences=[text],
                     semantics=[sentence.semantics],
                     speaker=response.name if use_speaker else None,
-                    add_bos=idx == 0,
                     skip_text=random.random() < self.skip_text_prob,
                 )
 
@@ -360,7 +252,6 @@ class AutoAugTextDataset(IterableDataset):
                 final_text,
                 semantics=final_semantic,
                 speaker=response.name if use_speaker else None,
-                add_bos=True,
             )
             all_tokens.append(tokens)
             all_labels.append(labels)
@@ -371,84 +262,15 @@ class AutoAugTextDataset(IterableDataset):
         # Verify that the length is correct
         assert tokens.size(1) == labels.size(1), f"{tokens.size(1)} != {labels.size(1)}"
 
-        # Verify bos token
-        assert tokens[0, 0] == self.tokenizer.bos_token_id
-
         data = {"tokens": tokens, "labels": labels}
 
-        if self.use_negative_samples:
-            negative_samples = self.generate_negative_samples(all_tokens, all_labels)
-            data.update(negative_samples)
-
         return data
-
-    def generate_negative_samples(self, all_tokens, all_labels):
-        new_tokens, new_labels = [], []
-
-        for tokens, labels in zip(all_tokens, all_labels):
-            # If all codebooks are not -100, we find where it starts
-            start = torch.where(labels[1:].sum(0) != -100 * (labels.size(0) - 1))[0][0]
-            assert (labels[1:, start:] != -100).all()  # This shouldn't happen
-
-            mode = random.choice(["repeat", "lost", "noise"])
-            begin = random.randint(start, labels.size(1) - 1)
-            end = random.randint(begin, labels.size(1) - 1)
-
-            if mode == "repeat":
-                tokens = torch.cat(
-                    [
-                        tokens[:, :begin],
-                        tokens[:, begin:end],
-                        tokens[:, begin:end],
-                        tokens[:, end:],
-                    ],
-                    dim=1,
-                )
-                labels = torch.cat(
-                    [
-                        labels[:, :begin],
-                        labels[:, begin:end],
-                        labels[:, begin:end],
-                        labels[:, end:],
-                    ],
-                    dim=1,
-                )
-            elif mode == "lost":
-                tokens = torch.cat([tokens[:, :begin], tokens[:, end:]], dim=1)
-                labels = torch.cat([labels[:, :begin], labels[:, end:]], dim=1)
-            elif mode == "noise":
-                middle_tokens, middle_labels = (
-                    tokens[:, begin:end],
-                    labels[:, begin:end],
-                )
-                random_order0 = torch.randperm(middle_tokens.size(1))
-                random_order1 = torch.randperm(middle_tokens.size(1))
-                middle_tokens = middle_tokens[:, random_order0]
-                middle_labels = middle_labels[:, random_order1]
-                tokens = torch.cat(
-                    [tokens[:, :begin], middle_tokens, tokens[:, end:]], dim=1
-                )
-                labels = torch.cat(
-                    [labels[:, :begin], middle_labels, labels[:, end:]], dim=1
-                )
-
-            new_tokens.append(tokens)
-            new_labels.append(labels)
-
-        tokens = torch.cat(new_tokens, dim=1)
-        labels = torch.cat(new_labels, dim=1)
-
-        # Verify that the length is correct
-        assert tokens.size(1) == labels.size(1), f"{tokens.size(1)} != {labels.size(1)}"
-
-        return {"negative_tokens": tokens, "negative_labels": labels}
 
     def pack_sentences(
         self,
         sentences: list[str],
         semantics: list,
         speaker: Optional[str] = None,
-        add_bos: bool = True,
         skip_text: bool = False,
     ):
         if speaker is None:
@@ -456,10 +278,10 @@ class AutoAugTextDataset(IterableDataset):
 
         cated_sentences = " ".join(sentences)
         if skip_text:
-            cated_sentences = SKIP_TEXT_STRING
+            cated_sentences = "<|skip_text|>"
 
-        final_text = "<|im_start|>user<|im_sep|>" + cated_sentences + "<|im_end|>"
-        final_text = final_text + f"<|im_start|>{speaker}<|im_sep|>"
+        final_text = "<|im_start|>user\n" + cated_sentences + "<|im_end|>"
+        final_text = final_text + f"<|im_start|>{speaker}\n"
 
         encoded = self.tokenizer.encode(
             final_text,
@@ -473,32 +295,22 @@ class AutoAugTextDataset(IterableDataset):
             len(semantics[0]) if self.num_codebooks is None else self.num_codebooks
         )
 
-        bos_bias = 1 if add_bos else 0
-
         # Pack the tokens and semantics (add <s> and </s> to semantic tokens)
         tokens = (
             encoded
             + [self.semantic_token_id] * semantic_length
-            + self.tokenizer.convert_tokens_to_ids(
-                ["<|im_end|>", "<|end_of_sequence|>"]
-            )
+            + self.tokenizer.convert_tokens_to_ids(["<|im_end|>"])
         )
 
-        if add_bos:
-            tokens = [self.tokenizer.bos_token_id] + tokens
-
         # Codebook bos/padding: 0, eos: 1
-        codes = [
-            [CODEBOOK_PAD_TOKEN_ID] * (prompt_length + bos_bias)
-            for _ in range(num_codebooks)
-        ]
+        codes = [[CODEBOOK_PAD_TOKEN_ID] * prompt_length for _ in range(num_codebooks)]
         for segment in semantics:
             for book_idx, book in zip(range(num_codebooks), segment):
                 for j in book.values:
-                    codes[book_idx].append(int(j) + 2)
+                    codes[book_idx].append(int(j) + 1)
 
         for book in codes:
-            book.extend([CODEBOOK_EOS_TOKEN_ID] * 2)
+            book.extend([CODEBOOK_PAD_TOKEN_ID] * 1)
 
         tokens = [tokens] + codes
 
@@ -512,16 +324,14 @@ class AutoAugTextDataset(IterableDataset):
 
         # Mask out the <s> tokens for semantic, predict semantic tokens only
         # Since we don't mask out the input tokens, the language modeling still works
-        labels[1:, : (prompt_length + bos_bias)] = -100
+        labels[1:, :prompt_length] = -100
 
         tokens = tokens[:, :-1]
         labels = labels[:, 1:]
 
         # Verify the padding is correct, and the last token is eos
-        assert add_bos is False or tokens[0, 0] == self.tokenizer.bos_token_id
-        assert (tokens[1:, : prompt_length + bos_bias] == CODEBOOK_PAD_TOKEN_ID).all()
-        assert labels[0, -1] == self.tokenizer.eos_token_id
-        assert (labels[1:, -2:] == CODEBOOK_EOS_TOKEN_ID).all()
+        assert (tokens[1:, :prompt_length] == CODEBOOK_PAD_TOKEN_ID).all()
+        assert (labels[1:, -1:] == CODEBOOK_PAD_TOKEN_ID).all()
 
         return tokens, labels
 
@@ -630,11 +440,11 @@ class InterleaveDataset(IterableDataset):
                 yield next(dataset_iterators[dataset_idx])
 
 
-class TextDataModule(LightningDataModule):
+class SemanticDataModule(LightningDataModule):
     def __init__(
         self,
-        train_dataset: Union[StreamTextDataset, AutoAugTextDataset, InterleaveDataset],
-        val_dataset: Union[StreamTextDataset, AutoAugTextDataset, InterleaveDataset],
+        train_dataset: Union[AutoTextSemanticInstructionDataset, InterleaveDataset],
+        val_dataset: Union[AutoTextSemanticInstructionDataset, InterleaveDataset],
         batch_size: int = 32,
         tokenizer: AutoTokenizer = None,
         max_length: int = 1024,
@@ -671,12 +481,11 @@ class TextDataModule(LightningDataModule):
 if __name__ == "__main__":
     from tqdm import tqdm
 
-    ds = AutoAugTextDataset(
+    ds = AutoTextSemanticInstructionDataset(
         ["data/protos"],
         tokenizer=AutoTokenizer.from_pretrained("fishaudio/fish-speech-1"),
         use_speaker=False,
         interactive_prob=1.0,
-        use_negative_samples=False,
         skip_text_prob=0.5,
     )
 

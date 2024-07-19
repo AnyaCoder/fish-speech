@@ -1,11 +1,13 @@
 import base64
 import io
+import json
 import queue
-import threading
+import random
 import traceback
 import wave
 from argparse import ArgumentParser
 from http import HTTPStatus
+from pathlib import Path
 from typing import Annotated, Literal, Optional
 
 import librosa
@@ -13,7 +15,7 @@ import numpy as np
 import pyrootutils
 import soundfile as sf
 import torch
-from kui.wsgi import (
+from kui.asgi import (
     Body,
     HTTPException,
     HttpView,
@@ -22,15 +24,15 @@ from kui.wsgi import (
     OpenAPI,
     StreamResponse,
 )
-from kui.wsgi.routing import MultimethodRoutes
+from kui.asgi.routing import MultimethodRoutes
 from loguru import logger
 from pydantic import BaseModel, Field
-from transformers import AutoTokenizer
 
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from fish_speech.models.vits_decoder.lit_module import VITSDecoder
-from fish_speech.models.vqgan.lit_module import VQGAN
+# from fish_speech.models.vqgan.lit_module import VQGAN
+from fish_speech.models.vqgan.modules.firefly import FireflyArchitecture
+from tools.auto_rerank import batch_asr, calculate_wer, is_chinese, load_model
 from tools.llama.generate import (
     GenerateRequest,
     GenerateResponse,
@@ -54,7 +56,7 @@ def wav_chunk_header(sample_rate=44100, bit_depth=16, channels=1):
 
 
 # Define utils for web server
-def http_execption_handler(exc: HTTPException):
+async def http_execption_handler(exc: HTTPException):
     return JSONResponse(
         dict(
             statusCode=exc.status_code,
@@ -66,7 +68,7 @@ def http_execption_handler(exc: HTTPException):
     )
 
 
-def other_exception_handler(exc: "Exception"):
+async def other_exception_handler(exc: "Exception"):
     traceback.print_exc()
 
     status = HTTPStatus.INTERNAL_SERVER_ERROR
@@ -76,12 +78,25 @@ def other_exception_handler(exc: "Exception"):
     )
 
 
+def load_audio(reference_audio, sr):
+    if len(reference_audio) > 255 or not Path(reference_audio).exists():
+        try:
+            audio_data = base64.b64decode(reference_audio)
+            reference_audio = io.BytesIO(audio_data)
+        except base64.binascii.Error:
+            raise ValueError("Invalid path or base64 string")
+
+    audio, _ = librosa.load(reference_audio, sr=sr, mono=True)
+    return audio
+
+
 def encode_reference(*, decoder_model, reference_audio, enable_reference_audio):
     if enable_reference_audio and reference_audio is not None:
         # Load audios, and prepare basic info here
-        reference_audio_content, _ = librosa.load(
-            reference_audio, sr=decoder_model.sampling_rate, mono=True
+        reference_audio_content = load_audio(
+            reference_audio, decoder_model.spec_transform.sample_rate
         )
+
         audios = torch.from_numpy(reference_audio_content).to(decoder_model.device)[
             None, None, :
         ]
@@ -89,72 +104,34 @@ def encode_reference(*, decoder_model, reference_audio, enable_reference_audio):
             [audios.shape[2]], device=decoder_model.device, dtype=torch.long
         )
         logger.info(
-            f"Loaded audio with {audios.shape[2] / decoder_model.sampling_rate:.2f} seconds"
+            f"Loaded audio with {audios.shape[2] / decoder_model.spec_transform.sample_rate:.2f} seconds"
         )
 
         # VQ Encoder
-        if isinstance(decoder_model, VQGAN):
+        if isinstance(decoder_model, FireflyArchitecture):
             prompt_tokens = decoder_model.encode(audios, audio_lengths)[0][0]
-            reference_embedding = None  # VQGAN does not have reference embedding
-        elif isinstance(decoder_model, VITSDecoder):
-            reference_spec = decoder_model.spec_transform(audios[0])
-            reference_embedding = decoder_model.generator.encode_ref(
-                reference_spec,
-                torch.tensor([reference_spec.shape[-1]], device=decoder_model.device),
-            )
-            logger.info(f"Loaded reference audio from {reference_audio}")
-            prompt_tokens = decoder_model.generator.vq.encode(audios, audio_lengths)[0][
-                0
-            ]
-        else:
-            raise ValueError(f"Unknown model type: {type(decoder_model)}")
 
         logger.info(f"Encoded prompt: {prompt_tokens.shape}")
-    elif isinstance(decoder_model, VITSDecoder):
-        prompt_tokens = None
-        reference_embedding = torch.zeros(
-            1, decoder_model.generator.gin_channels, 1, device=decoder_model.device
-        )
-        logger.info("No reference audio provided, use zero embedding")
     else:
         prompt_tokens = None
-        reference_embedding = None
         logger.info("No reference audio provided")
 
-    return prompt_tokens, reference_embedding
+    return prompt_tokens
 
 
 def decode_vq_tokens(
     *,
     decoder_model,
     codes,
-    text_tokens: torch.Tensor | None = None,
-    reference_embedding: torch.Tensor | None = None,
 ):
     feature_lengths = torch.tensor([codes.shape[1]], device=decoder_model.device)
     logger.info(f"VQ features: {codes.shape}")
 
-    if isinstance(decoder_model, VQGAN):
+    if isinstance(decoder_model, FireflyArchitecture):
         # VQGAN Inference
         return decoder_model.decode(
             indices=codes[None],
             feature_lengths=feature_lengths,
-            return_audios=True,
-        ).squeeze()
-
-    if isinstance(decoder_model, VITSDecoder):
-        # VITS Inference
-        quantized = decoder_model.generator.vq.indicies_to_vq_features(
-            indices=codes[None], feature_lengths=feature_lengths
-        )
-        logger.info(f"Restored VQ features: {quantized.shape}")
-
-        return decoder_model.generator.decode(
-            quantized,
-            torch.tensor([quantized.shape[-1]], device=decoder_model.device),
-            text_tokens,
-            torch.tensor([text_tokens.shape[-1]], device=decoder_model.device),
-            ge=reference_embedding,
         ).squeeze()
 
     raise ValueError(f"Unknown model type: {type(decoder_model)}")
@@ -163,18 +140,67 @@ def decode_vq_tokens(
 routes = MultimethodRoutes(base_class=HttpView)
 
 
+def get_random_paths(base_path, data, speaker, emotion):
+    if base_path and data and speaker and emotion and (Path(base_path).exists()):
+        if speaker in data and emotion in data[speaker]:
+            files = data[speaker][emotion]
+            lab_files = [f for f in files if f.endswith(".lab")]
+            wav_files = [f for f in files if f.endswith(".wav")]
+
+            if lab_files and wav_files:
+                selected_lab = random.choice(lab_files)
+                selected_wav = random.choice(wav_files)
+
+                lab_path = Path(base_path) / speaker / emotion / selected_lab
+                wav_path = Path(base_path) / speaker / emotion / selected_wav
+                if lab_path.exists() and wav_path.exists():
+                    return lab_path, wav_path
+
+    return None, None
+
+
+def load_json(json_file):
+    if not json_file:
+        logger.info("Not using a json file")
+        return None
+    try:
+        with open(json_file, "r", encoding="utf-8") as file:
+            data = json.load(file)
+    except FileNotFoundError:
+        logger.warning(f"ref json not found: {json_file}")
+        data = None
+    except Exception as e:
+        logger.warning(f"Loading json failed: {e}")
+        data = None
+    return data
+
+
 class InvokeRequest(BaseModel):
     text: str = "你说的对, 但是原神是一款由米哈游自主研发的开放世界手游."
     reference_text: Optional[str] = None
     reference_audio: Optional[str] = None
-    max_new_tokens: int = 0
-    chunk_length: Annotated[int, Field(ge=0, le=500, strict=True)] = 150
+    max_new_tokens: int = 1024
+    chunk_length: Annotated[int, Field(ge=0, le=500, strict=True)] = 100
     top_p: Annotated[float, Field(ge=0.1, le=1.0, strict=True)] = 0.7
-    repetition_penalty: Annotated[float, Field(ge=0.9, le=2.0, strict=True)] = 1.5
+    repetition_penalty: Annotated[float, Field(ge=0.9, le=2.0, strict=True)] = 1.2
     temperature: Annotated[float, Field(ge=0.1, le=1.0, strict=True)] = 0.7
-    speaker: Optional[str] = None
+    emotion: Optional[str] = None
     format: Literal["wav", "mp3", "flac"] = "wav"
     streaming: bool = False
+    ref_json: Optional[str] = "ref_data.json"
+    ref_base: Optional[str] = "ref_data"
+    speaker: Optional[str] = None
+
+
+def get_content_type(audio_format):
+    if audio_format == "wav":
+        return "audio/wav"
+    elif audio_format == "flac":
+        return "audio/flac"
+    elif audio_format == "mp3":
+        return "audio/mpeg"
+    else:
+        return "application/octet-stream"
 
 
 @torch.inference_mode()
@@ -182,20 +208,28 @@ def inference(req: InvokeRequest):
     # Parse reference audio aka prompt
     prompt_tokens = None
 
+    ref_data = load_json(req.ref_json)
+    ref_base = req.ref_base
+
+    lab_path, wav_path = get_random_paths(ref_base, ref_data, req.speaker, req.emotion)
+
+    if lab_path and wav_path:
+        with open(lab_path, "r", encoding="utf-8") as lab_file:
+            ref_text = lab_file.read()
+        req.reference_audio = wav_path
+        req.reference_text = ref_text
+        logger.info("ref_path: " + str(wav_path))
+        logger.info("ref_text: " + ref_text)
+
     # Parse reference audio aka prompt
-    prompt_tokens, reference_embedding = encode_reference(
+    prompt_tokens = encode_reference(
         decoder_model=decoder_model,
-        reference_audio=(
-            io.BytesIO(base64.b64decode(req.reference_audio))
-            if req.reference_audio is not None
-            else None
-        ),
+        reference_audio=req.reference_audio,
         enable_reference_audio=req.reference_audio is not None,
     )
-
+    logger.info(f"ref_text: {req.reference_text}")
     # LLAMA Inference
     request = dict(
-        tokenizer=llama_tokenizer,
         device=decoder_model.device,
         max_new_tokens=req.max_new_tokens,
         text=req.text,
@@ -205,8 +239,7 @@ def inference(req: InvokeRequest):
         compile=args.compile,
         iterative_prompt=req.chunk_length > 0,
         chunk_length=req.chunk_length,
-        max_length=args.max_length,
-        speaker=req.speaker,
+        max_length=2048,
         prompt_tokens=prompt_tokens,
         prompt_text=req.reference_text,
     )
@@ -233,18 +266,12 @@ def inference(req: InvokeRequest):
         if result.action == "next":
             break
 
-        text_tokens = llama_tokenizer.encode(result.text, return_tensors="pt").to(
-            decoder_model.device
-        )
-
         with torch.autocast(
             device_type=decoder_model.device.type, dtype=args.precision
         ):
             fake_audios = decode_vq_tokens(
                 decoder_model=decoder_model,
                 codes=result.codes,
-                text_tokens=text_tokens,
-                reference_embedding=reference_embedding,
             )
 
         fake_audios = fake_audios.float().cpu().numpy()
@@ -267,8 +294,50 @@ def inference(req: InvokeRequest):
     yield fake_audios
 
 
+def auto_rerank_inference(req: InvokeRequest, use_auto_rerank: bool = True):
+    if not use_auto_rerank:
+        # 如果不使用 auto_rerank，直接调用原始的 inference 函数
+        return inference(req)
+
+    zh_model, en_model = load_model()
+    max_attempts = 5
+    best_wer = float("inf")
+    best_audio = None
+
+    for attempt in range(max_attempts):
+        # 调用原始的 inference 函数
+        audio_generator = inference(req)
+        fake_audios = next(audio_generator)
+
+        asr_result = batch_asr(
+            zh_model if is_chinese(req.text) else en_model, [fake_audios], 44100
+        )[0]
+        wer = calculate_wer(req.text, asr_result["text"])
+
+        if wer <= 0.1 and not asr_result["huge_gap"]:
+            return fake_audios
+
+        if wer < best_wer:
+            best_wer = wer
+            best_audio = fake_audios
+
+        if attempt == max_attempts - 1:
+            break
+
+    return best_audio
+
+
+async def inference_async(req: InvokeRequest):
+    for chunk in inference(req):
+        yield chunk
+
+
+async def buffer_to_async_generator(buffer):
+    yield buffer
+
+
 @routes.http.post("/v1/invoke")
-def api_invoke_model(
+async def api_invoke_model(
     req: Annotated[InvokeRequest, Body(exclusive=True)],
 ):
     """
@@ -287,31 +356,35 @@ def api_invoke_model(
             content="Streaming only supports WAV format",
         )
 
-    generator = inference(req)
     if req.streaming:
         return StreamResponse(
-            iterable=generator,
+            iterable=inference_async(req),
             headers={
                 "Content-Disposition": f"attachment; filename=audio.{req.format}",
             },
-            content_type="audio/wav",
+            content_type=get_content_type(req.format),
         )
     else:
-        fake_audios = next(generator)
+        fake_audios = next(inference(req))
         buffer = io.BytesIO()
-        sf.write(buffer, fake_audios, decoder_model.sampling_rate, format=req.format)
+        sf.write(
+            buffer,
+            fake_audios,
+            decoder_model.spec_transform.sample_rate,
+            format=req.format,
+        )
 
         return StreamResponse(
-            iterable=[buffer.getvalue()],
+            iterable=buffer_to_async_generator(buffer.getvalue()),
             headers={
                 "Content-Disposition": f"attachment; filename=audio.{req.format}",
             },
-            content_type="audio/wav",
+            content_type=get_content_type(req.format),
         )
 
 
 @routes.http.post("/v1/health")
-def api_health():
+async def api_health():
     """
     Health check
     """
@@ -324,24 +397,21 @@ def parse_args():
     parser.add_argument(
         "--llama-checkpoint-path",
         type=str,
-        default="checkpoints/text2semantic-sft-medium-v1-4k.pth",
-    )
-    parser.add_argument(
-        "--llama-config-name", type=str, default="dual_ar_2_codebook_medium"
+        default="checkpoints/fish-speech-1.2-sft",
     )
     parser.add_argument(
         "--decoder-checkpoint-path",
         type=str,
-        default="checkpoints/vq-gan-group-fsq-2x1024.pth",
+        default="checkpoints/fish-speech-1.2-sft/firefly-gan-vq-fsq-4x1024-42hz-generator.pth",
     )
-    parser.add_argument("--decoder-config-name", type=str, default="vqgan_pretrain")
-    parser.add_argument("--tokenizer", type=str, default="fishaudio/fish-speech-1")
+    parser.add_argument("--decoder-config-name", type=str, default="firefly_gan_vq")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--half", action="store_true")
-    parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--max-text-length", type=int, default=0)
     parser.add_argument("--listen", type=str, default="127.0.0.1:8000")
+    parser.add_argument("--workers", type=int, default=1)
+    parser.add_argument("--use-auto-rerank", type=bool, default=True)
 
     return parser.parse_args()
 
@@ -366,21 +436,18 @@ app = Kui(
 if __name__ == "__main__":
     import threading
 
-    from zibai import create_bind_socket, serve
+    import uvicorn
 
     args = parse_args()
     args.precision = torch.half if args.half else torch.bfloat16
 
     logger.info("Loading Llama model...")
     llama_queue = launch_thread_safe_queue(
-        config_name=args.llama_config_name,
         checkpoint_path=args.llama_checkpoint_path,
         device=args.device,
         precision=args.precision,
-        max_length=args.max_length,
         compile=args.compile,
     )
-    llama_tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
     logger.info("Llama model loaded, loading VQ-GAN model...")
 
     decoder_model = load_decoder_model(
@@ -395,28 +462,21 @@ if __name__ == "__main__":
     list(
         inference(
             InvokeRequest(
-                text="A warm-up sentence.",
+                text="Hello world.",
                 reference_text=None,
                 reference_audio=None,
                 max_new_tokens=0,
-                chunk_length=150,
                 top_p=0.7,
-                repetition_penalty=1.5,
+                repetition_penalty=1.2,
                 temperature=0.7,
-                speaker=None,
+                emotion=None,
                 format="wav",
+                ref_base=None,
+                ref_json=None,
             )
         )
     )
 
     logger.info(f"Warming up done, starting server at http://{args.listen}")
-    sock = create_bind_socket(args.listen)
-    sock.listen()
-
-    # Start server
-    serve(
-        app=app,
-        bind_sockets=[sock],
-        max_workers=10,
-        graceful_exit=threading.Event(),
-    )
+    host, port = args.listen.split(":")
+    uvicorn.run(app, host=host, port=int(port), workers=args.workers, log_level="info")

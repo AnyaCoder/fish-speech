@@ -2,7 +2,9 @@
 chcp 65001
 
 set USE_MIRROR=true
-echo use_mirror = %USE_MIRROR%
+set INSTALL_TYPE=preview
+echo "USE_MIRROR: %USE_MIRROR%"
+echo "INSTALL_TYPE: %INSTALL_TYPE%"
 setlocal enabledelayedexpansion
 
 cd /D "%~dp0"
@@ -11,21 +13,20 @@ set PATH="%PATH%";%SystemRoot%\system32
 
 echo %PATH%
 
-:: 安装Miniconda
-:: 检查是否有特殊字符
+
 echo "%CD%"| findstr /R /C:"[!#\$%&()\*+,;<=>?@\[\]\^`{|}~\u4E00-\u9FFF ] " >nul && (
     echo.
-    echo 当前路径中存在特殊字符，请使fish-speech的路径不含特殊字符后再运行。 && (
+    echo There are special characters in the current path, please make the path of fish-speech free of special characters before running. && (
         goto end
     )
 )
 
-:: 解决跨驱动器安装问题
+
 set TMP=%CD%\fishenv
 set TEMP=%CD%\fishenv
-:: 取消激活已经激活的环境
+
 (call conda deactivate && call conda deactivate && call conda deactivate) 2>nul
-:: 安装路径配置
+
 set INSTALL_DIR=%cd%\fishenv
 set CONDA_ROOT_PREFIX=%cd%\fishenv\conda
 set INSTALL_ENV_DIR=%cd%\fishenv\env
@@ -36,96 +37,103 @@ set MINICONDA_DOWNLOAD_URL=https://mirrors.tuna.tsinghua.edu.cn/anaconda/minicon
 set MINICONDA_CHECKSUM=307194e1f12bbeb52b083634e89cc67db4f7980bd542254b43d3309eaf7cb358
 set conda_exists=F
 
-:: 确定是否要安装conda
 call "%CONDA_ROOT_PREFIX%\_conda.exe" --version >nul 2>&1
 if "%ERRORLEVEL%" EQU "0" set conda_exists=T
-:: 下载Miniconda
+
 if "%conda_exists%" == "F" (
     echo.
-    echo 正在下载Miniconda...
+    echo Downloading Miniconda...
     mkdir "%INSTALL_DIR%" 2>nul
-    :: 使用curl下载Miniconda安装程序
     call curl -Lk "%MINICONDA_DOWNLOAD_URL%" > "%INSTALL_DIR%\miniconda_installer.exe"
-    :: 检查下载是否成功
     if errorlevel 1 (
         echo.
-        echo 下载Miniconda失败
+        echo Failed to download miniconda.
         goto end
     )
-    :: 哈希校验
     for /f %%a in ('
         certutil -hashfile "%INSTALL_DIR%\miniconda_installer.exe" sha256
         ^| find /i /v " "
         ^| find /i "%MINICONDA_CHECKSUM%"
     ') do (
-        :: 如果哈希值匹配预设的校验和，将其存储在变量中
         set "hash=%%a"
     )
     if not defined hash (
         echo.
-        echo Miniconda安装程序的哈希值不匹配
+        echo Miniconda hash mismatched!
         del "%INSTALL_DIR%\miniconda_installer.exe"
         goto end
     ) else (
         echo.
-        echo Miniconda安装程序的哈希值成功匹配
+        echo Miniconda hash matched successfully.
     )
-    echo 下载完成，接下来安装Miniconda至"%CONDA_ROOT_PREFIX%"
+    echo Downloaded "%CONDA_ROOT_PREFIX%"
     start /wait "" "%INSTALL_DIR%\miniconda_installer.exe" /InstallationType=JustMe /NoShortcuts=1 /AddToPath=0 /RegisterPython=0 /NoRegistry=1 /S /D=%CONDA_ROOT_PREFIX%
-    :: 测试是否成功安装
+
     call "%CONDA_ROOT_PREFIX%\_conda.exe" --version
     if errorlevel 1 (
         echo.
-        echo 未安装Miniconda
+        echo Cannot install Miniconda.
         goto end
     ) else (
         echo.
-        echo Miniconda安装成功
+        echo Miniconda Install success.
     )
-    :: 删除安装程序
+
     del "%INSTALL_DIR%\miniconda_installer.exe"
 )
 
-:: 创建conda环境
+
 if not exist "%INSTALL_ENV_DIR%" (
     echo.
-    echo 正在创建conda环境...
+    echo Creating Conda Environment...
     call "%CONDA_ROOT_PREFIX%\_conda.exe" create --no-shortcuts -y -k --prefix "%INSTALL_ENV_DIR%" -c https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/main/ python=3.10
-    :: 检查环境创建是否成功
+
     if errorlevel 1 (
         echo.
-        echo 创建conda环境失败
+        echo Failed to Create Environment.
         goto end
     )
 )
-:: 检查是否真的创建了环境
+
 if not exist "%INSTALL_ENV_DIR%\python.exe" (
     echo.
-    echo Conda环境不存在
+    echo Conda Env does not exist.
     goto end
 )
-:: 环境隔离
+
 set PYTHONNOUSERSITE=1
 set PYTHONPATH=
 set PYTHONHOME=
 set "CUDA_PATH=%INSTALL_ENV_DIR%"
 set "CUDA_HOME=%CUDA_PATH%"
-:: 激活环境
+
 call "%CONDA_ROOT_PREFIX%\condabin\conda.bat" activate "%INSTALL_ENV_DIR%"
-:: 检查环境是否成功激活
+
 if errorlevel 1 (
     echo.
-    echo 环境激活失败
+    echo Failed to activate Env.
     goto end
 ) else (
     echo.
-    echo 环境激活成功
+    echo successfully create env.
 )
 
-:: 安装依赖
+
 set "packages=torch torchvision torchaudio openai-whisper fish-speech"
 
-:: 检查包是否已安装，如果没有安装则添加到需要安装的包列表
+if "!INSTALL_TYPE!" == "preview" (
+    set "packages=!packages! triton_windows"
+)
+
+set "HF_ENDPOINT=https://huggingface.co"
+set "no_proxy="
+if "!USE_MIRROR!" == "true" (
+    set "HF_ENDPOINT=https://hf-mirror.com"
+    set "no_proxy=localhost, 127.0.0.1, 0.0.0.0"
+)
+echo "HF_ENDPOINT: !HF_ENDPOINT!"
+echo "NO_PROXY: !no_proxy!"
+
 set "install_packages="
 for %%p in (%packages%) do (
     %PIP_CMD% show %%p >nul 2>&1
@@ -134,11 +142,110 @@ for %%p in (%packages%) do (
     )
 )
 
+if not "!install_packages!"=="" (
+    echo.
+    echo Installing: !install_packages!
+    for %%p in (!install_packages!) do (
+        if "!INSTALL_TYPE!"=="preview" (
+            if "%%p"=="torch" (
+                set "WHEEL_FILE=torch-2.4.0.dev20240427+cu121-cp310-cp310-win_amd64.whl"
+                set "URL=!HF_ENDPOINT!/datasets/SpicyqSama007/windows_compile/resolve/main/torch-2.4.0.dev20240427_cu121-cp310-cp310-win_amd64.whl?download=true"
+                set "CHKSUM=b091308f4cb74e63d0323afd67c92f2279d9e488d8cbf467bcc7b939bcd74e0b"
+                :TORCH_DOWNLOAD
+                echo "%CD%\!WHEEL_FILE!"
+                if not exist "%CD%\!WHEEL_FILE!" (
+                    call curl -Lk "!URL!" --output "!WHEEL_FILE!"
+                )
+                for /f "delims=" %%I in ('certutil -hashfile "!WHEEL_FILE!" SHA256 ^| find /i "!CHKSUM!"') do (
+                    set "FILE_VALID=true"
+                )
+                if not defined FILE_VALID (
+                    echo File checksum does not match, re-downloading...
+                    del "!WHEEL_FILE!"
+                    goto TORCH_DOWNLOAD
+                )
+                echo "OK for !WHEEL_FILE!"
+                %PIP_CMD% install "%CD%\!WHEEL_FILE!" --no-warn-script-location
+                del "!WHEEL_FILE!"
+            ) else if "%%p"=="torchvision" (
+                set "WHEEL_FILE=torchvision-0.19.0.dev20240428+cu121-cp310-cp310-win_amd64.whl"
+                set "URL=!HF_ENDPOINT!/datasets/SpicyqSama007/windows_compile/resolve/main/torchvision-0.19.0.dev20240428_cu121-cp310-cp310-win_amd64.whl?download=true"
+                set "CHKSUM=7e46d0a89534013f001563d15e80f9eb431089571720c51f2cc595feeb01d785"
+                :TORCHVISION_DOWNLOAD
+                if not exist "!WHEEL_FILE!" (
+                    call curl -Lk "!URL!" --output "!WHEEL_FILE!"
+                )
+                for /f "delims=" %%I in ('certutil -hashfile "!WHEEL_FILE!" SHA256 ^| find /i "!CHKSUM!"') do (
+                    set "FILE_VALID=true"
+                )
+                if not defined FILE_VALID (
+                    echo File checksum does not match, re-downloading...
+                    del "!WHEEL_FILE!"
+                    goto TORCHVISION_DOWNLOAD
+                )
+                echo "OK for !WHEEL_FILE!"
+                %PIP_CMD% install "%CD%\!WHEEL_FILE!" --no-warn-script-location
+                del "!WHEEL_FILE!"
+            ) else if "%%p"=="torchaudio" (
+                set "WHEEL_FILE=torchaudio-2.2.0.dev20240427+cu121-cp310-cp310-win_amd64.whl"
+                set "URL=!HF_ENDPOINT!/datasets/SpicyqSama007/windows_compile/resolve/main/torchaudio-2.2.0.dev20240427_cu121-cp310-cp310-win_amd64.whl?download=true"
+                set "CHKSUM=abafb4bc82cbc6f58f18e1b95191bc1884c28e404781082db2eb540b4fae8a5d"
+                :TORCHAUDIO_DOWNLOAD
+                if not exist "!WHEEL_FILE!" (
+                    call curl -Lk "!URL!" --output "!WHEEL_FILE!"
+                )
+                for /f "delims=" %%I in ('certutil -hashfile "!WHEEL_FILE!" SHA256 ^| find /i "!CHKSUM!"') do (
+                    set "FILE_VALID=true"
+                )
+                if not defined FILE_VALID (
+                    echo File checksum does not match, re-downloading...
+                    del "!WHEEL_FILE!"
+                    goto TORCHAUDIO_DOWNLOAD
+                )
+                echo "OK for !WHEEL_FILE!"
+                %PIP_CMD% install "%CD%\!WHEEL_FILE!" --no-warn-script-location
+                del "!WHEEL_FILE!"
+            ) else if "%%p"=="openai-whisper" (
+                %PIP_CMD% install openai-whisper --no-warn-script-location
+            ) else if "%%p"=="fish-speech" (
+                %PIP_CMD% install -e .
+            ) else if "%%p"=="triton_windows" (
+                set "WHEEL_FILE=triton_windows-0.1.0-py3-none-any.whl"
+                set "URL=!HF_ENDPOINT!/datasets/SpicyqSama007/windows_compile/resolve/main/triton_windows-0.1.0-py3-none-any.whl?download=true"
+                set "CHKSUM=2cc998638180f37cf5025ab65e48c7f629aa5a369176cfa32177d2bd9aa26a0a"
+                :TRITON_DOWNLOAD
+                if not exist "!WHEEL_FILE!" (
+                    call curl -Lk "!URL!" --output "!WHEEL_FILE!"
+                )
+                for /f "delims=" %%I in ('certutil -hashfile "!WHEEL_FILE!" SHA256 ^| find /i "!CHKSUM!"') do (
+                    set "FILE_VALID=true"
+                )
+                if not defined FILE_VALID (
+                    echo File checksum does not match, re-downloading...
+                    del "!WHEEL_FILE!"
+                    goto TRITON_DOWNLOAD
+                )
+                echo "OK for !WHEEL_FILE!"
+                %PIP_CMD% install "%CD%\!WHEEL_FILE!" --no-warn-script-location
+                del "!WHEEL_FILE!"
+            )
+            
+        )
+    )
+)
+
+set "install_packages="
+for %%p in (%packages%) do (
+    %PIP_CMD% show %%p >nul 2>&1
+    if errorlevel 1 (
+        set "install_packages=!install_packages! %%p"
+    )
+)
 
 if not "!install_packages!"=="" (
     echo.
-    echo 正在安装以下包: !install_packages!
-    :: 针对不同的包使用不同的安装源
+    echo Installing: !install_packages!
+
     for %%p in (!install_packages!) do (
         if "!USE_MIRROR!"=="true" (
             if "%%p"=="torch" (
@@ -152,7 +259,9 @@ if not "!install_packages!"=="" (
             ) else if "%%p"=="fish-speech" (
                 %PIP_CMD% install -e . -i https://pypi.tuna.tsinghua.edu.cn/simple
             )
-        ) else (
+        ) 
+
+        if "!USE_MIRROR!"=="false" (
             if "%%p"=="torch" (
                 %PIP_CMD% install torch --index-url https://download.pytorch.org/whl/cu121 --no-warn-script-location
             ) else if "%%p"=="torchvision" (
@@ -165,9 +274,11 @@ if not "!install_packages!"=="" (
                 %PIP_CMD% install -e .
             )
         )
+        
     )
 )
-echo 环境检查并安装完成
+echo Environment Check: Success.
 
 endlocal
+:end
 pause

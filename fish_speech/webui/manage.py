@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime
 import html
 import json
 import os
@@ -26,9 +27,8 @@ from fish_speech.i18n import i18n
 from fish_speech.webui.launch_utils import Seafoam, is_module_installed, versions_html
 
 config_path = cur_work_dir / "fish_speech" / "configs"
-vqgan_yml_path = config_path / "vqgan_finetune.yaml"
+vqgan_yml_path = config_path / "firefly_gan_vq.yaml"
 llama_yml_path = config_path / "text2semantic_finetune.yaml"
-vits_yml_path = config_path / "vits_decoder_finetune.yaml"
 
 env = os.environ.copy()
 env["no_proxy"] = "127.0.0.1, localhost, 0.0.0.0"
@@ -132,26 +132,6 @@ def change_label(if_label):
         yield build_html_ok_message("Nothing")
 
 
-def change_decoder_config(decoder_model_path):
-    if "vits" in decoder_model_path:
-        choices = ["vits_decoder_finetune", "vits_decoder_pretrain"]
-        return gr.Dropdown(choices=choices, value=choices[0])
-    elif "vqgan" in decoder_model_path or "vq-gan" in decoder_model_path:
-        choices = ["vqgan_finetune", "vqgan_pretrain"]
-        return gr.Dropdown(choices=choices, value=choices[0])
-    else:
-        raise ValueError("Invalid decoder name")
-
-
-def change_llama_config(llama_model_path):
-    if "large" in llama_model_path:
-        return gr.Dropdown(value="dual_ar_2_codebook_large", interactive=False)
-    elif "medium" in llama_model_path:
-        return gr.Dropdown(value="dual_ar_2_codebook_medium", interactive=False)
-    else:
-        raise ValueError("Invalid model size")
-
-
 def clean_infer_cache():
     import tempfile
 
@@ -175,7 +155,6 @@ def change_infer(
     infer_decoder_model,
     infer_decoder_config,
     infer_llama_model,
-    infer_llama_config,
     infer_compile,
 ):
     global p_infer
@@ -202,10 +181,6 @@ def change_infer(
                 infer_decoder_config,
                 "--llama-checkpoint-path",
                 infer_llama_model,
-                "--llama-config-name",
-                infer_llama_config,
-                "--tokenizer",
-                "checkpoints",
             ]
             + (["--compile"] if infer_compile == "Yes" else []),
             env=env,
@@ -276,7 +251,13 @@ def new_explorer(data_path, max_depth):
     )
 
 
-def add_item(folder: str, method: str, label_lang: str):
+def add_item(
+    folder: str,
+    method: str,
+    label_lang: str,
+    if_initial_prompt: bool,
+    initial_prompt: str | None,
+):
     folder = folder.strip(" ").strip('"')
 
     folder_path = Path(folder)
@@ -285,7 +266,10 @@ def add_item(folder: str, method: str, label_lang: str):
         if folder_path.is_dir():
             items.append(folder)
             dict_items[folder] = dict(
-                type="folder", method=method, label_lang=label_lang
+                type="folder",
+                method=method,
+                label_lang=label_lang,
+                initial_prompt=initial_prompt if if_initial_prompt else None,
             )
         elif folder:
             err = folder
@@ -294,7 +278,8 @@ def add_item(folder: str, method: str, label_lang: str):
             )
 
     formatted_data = json.dumps(dict_items, ensure_ascii=False, indent=4)
-    logger.info(formatted_data)
+    logger.info("After Adding: " + formatted_data)
+    gr.Info(formatted_data)
     return gr.Checkboxgroup(choices=items), build_html_ok_message(
         i18n("Added path successfully!")
     )
@@ -308,6 +293,7 @@ def remove_items(selected_items):
     items = [item for item in items if item in dict_items.keys()]
     formatted_data = json.dumps(dict_items, ensure_ascii=False, indent=4)
     logger.info(formatted_data)
+    gr.Warning("After Removing: " + formatted_data)
     return gr.Checkboxgroup(choices=items, value=[]), build_html_ok_message(
         i18n("Removed path successfully!")
     )
@@ -376,6 +362,7 @@ def list_copy(list_file_path, method):
 def check_files(data_path: str, max_depth: int, label_model: str, label_device: str):
     global dict_items
     data_path = Path(data_path)
+    gr.Warning("Pre-processing begins...")
     for item, content in dict_items.items():
         item_path = Path(item)
         tar_path = data_path / item_path.name
@@ -394,23 +381,31 @@ def check_files(data_path: str, max_depth: int, label_model: str, label_device: 
                     convert_to_mono_in_place(audio_path)
 
             cur_lang = content["label_lang"]
+            initial_prompt = content["initial_prompt"]
+
+            transcribe_cmd = [
+                PYTHON,
+                "tools/whisper_asr.py",
+                "--model-size",
+                label_model,
+                "--device",
+                label_device,
+                "--audio-dir",
+                tar_path,
+                "--save-dir",
+                tar_path,
+                "--language",
+                cur_lang,
+            ]
+
+            if initial_prompt is not None:
+                transcribe_cmd += ["--initial-prompt", initial_prompt]
+
             if cur_lang != "IGNORE":
                 try:
+                    gr.Warning("Begin To Transcribe")
                     subprocess.run(
-                        [
-                            PYTHON,
-                            "tools/whisper_asr.py",
-                            "--model-size",
-                            label_model,
-                            "--device",
-                            label_device,
-                            "--audio-dir",
-                            tar_path,
-                            "--save-dir",
-                            tar_path,
-                            "--language",
-                            cur_lang,
-                        ],
+                        transcribe_cmd,
                         env=env,
                     )
                 except Exception:
@@ -424,29 +419,15 @@ def check_files(data_path: str, max_depth: int, label_model: str, label_device: 
     )
 
 
+def generate_folder_name():
+    now = datetime.datetime.now()
+    folder_name = now.strftime("%Y%m%d_%H%M%S")
+    return folder_name
+
+
 def train_process(
     data_path: str,
     option: str,
-    min_duration: float,
-    max_duration: float,
-    # vq-gan config
-    vqgan_ckpt,
-    vqgan_lr,
-    vqgan_maxsteps,
-    vqgan_data_num_workers,
-    vqgan_data_batch_size,
-    vqgan_data_val_batch_size,
-    vqgan_precision,
-    vqgan_check_interval,
-    # vits config
-    vits_ckpt,
-    vits_lr,
-    vits_maxsteps,
-    vits_data_num_workers,
-    vits_data_batch_size,
-    vits_data_val_batch_size,
-    vits_precision,
-    vits_check_interval,
     # llama config
     llama_ckpt,
     llama_base_config,
@@ -461,125 +442,21 @@ def train_process(
     llama_use_speaker,
     llama_use_lora,
 ):
-    import datetime
-
-    def generate_folder_name():
-        now = datetime.datetime.now()
-        folder_name = now.strftime("%Y%m%d_%H%M%S")
-        return folder_name
 
     backend = "nccl" if sys.platform == "linux" else "gloo"
 
     new_project = generate_folder_name()
-
     print("New Project Name: ", new_project)
 
-    if min_duration > max_duration:
-        min_duration, max_duration = max_duration, min_duration
-
-    if option == "VQGAN" or option == "VITS":
-        subprocess.run(
-            [
-                PYTHON,
-                "tools/vqgan/create_train_split.py",
-                str(data_pre_output.relative_to(cur_work_dir)),
-                "--min-duration",
-                str(min_duration),
-                "--max-duration",
-                str(max_duration),
-            ]
-        )
-
     if option == "VQGAN":
-        latest = next(
-            iter(
-                sorted(
-                    [
-                        str(p.relative_to("results"))
-                        for p in Path("results").glob("vqgan_*/")
-                    ],
-                    reverse=True,
-                )
-            ),
-            ("vqgan_" + new_project),
-        )
-        project = (
-            ("vqgan_" + new_project)
-            if vqgan_ckpt == i18n("new")
-            else (
-                latest
-                if vqgan_ckpt == i18n("latest")
-                else Path(vqgan_ckpt).relative_to("results")
-            )
-        )
-        logger.info(project)
-        train_cmd = [
-            PYTHON,
-            "fish_speech/train.py",
-            "--config-name",
-            "vqgan_finetune",
-            f"project={project}",
-            f"trainer.strategy.process_group_backend={backend}",
-            f"model.optimizer.lr={vqgan_lr}",
-            f"trainer.max_steps={vqgan_maxsteps}",
-            f"data.num_workers={vqgan_data_num_workers}",
-            f"data.batch_size={vqgan_data_batch_size}",
-            f"data.val_batch_size={vqgan_data_val_batch_size}",
-            f"trainer.precision={vqgan_precision}",
-            f"trainer.val_check_interval={vqgan_check_interval}",
-            f"train_dataset.filelist={str(data_pre_output / 'vq_train_filelist.txt')}",
-            f"val_dataset.filelist={str(data_pre_output / 'vq_val_filelist.txt')}",
-        ]
-        logger.info(train_cmd)
-        subprocess.run(train_cmd)
-
-    if option == "VITS":
-        latest = next(
-            iter(
-                sorted(
-                    [
-                        str(p.relative_to("results"))
-                        for p in Path("results").glob("vits_*/")
-                    ],
-                    reverse=True,
-                )
-            ),
-            ("vits_" + new_project),
-        )
-        project = (
-            ("vits_" + new_project)
-            if vits_ckpt == i18n("new")
-            else (
-                latest
-                if vits_ckpt == i18n("latest")
-                else Path(vits_ckpt).relative_to("results")
-            )
-        )
-        ckpt_path = str(Path("checkpoints/vits_decoder_v1.1.ckpt"))
-        logger.info(project)
-        train_cmd = [
-            PYTHON,
-            "fish_speech/train.py",
-            "--config-name",
-            "vits_decoder_finetune",
-            f"project={project}",
-            f"ckpt_path={ckpt_path}",
-            f"trainer.strategy.process_group_backend={backend}",
-            "tokenizer.pretrained_model_name_or_path=checkpoints",
-            f"model.optimizer.lr={vits_lr}",
-            f"trainer.max_steps={vits_maxsteps}",
-            f"data.num_workers={vits_data_num_workers}",
-            f"data.batch_size={vits_data_batch_size}",
-            f"data.val_batch_size={vits_data_val_batch_size}",
-            f"trainer.precision={vits_precision}",
-            f"trainer.val_check_interval={vits_check_interval}",
-            f"train_dataset.filelist={str(data_pre_output / 'vq_train_filelist.txt')}",
-            f"val_dataset.filelist={str(data_pre_output / 'vq_val_filelist.txt')}",
-        ]
-        logger.info(train_cmd)
-        subprocess.run(train_cmd)
+        msg = "Skipped VQGAN Training."
+        gr.Warning(msg)
+        logger.info(msg)
 
     if option == "LLAMA":
+        msg = "LLAMA Training begins..."
+        gr.Warning(msg)
+        logger.info(msg)
         subprocess.run(
             [
                 PYTHON,
@@ -590,9 +467,9 @@ def train_process(
                 "--batch-size",
                 "16",
                 "--config-name",
-                "vqgan_pretrain",
+                "firefly_gan_vq",
                 "--checkpoint-path",
-                "checkpoints/vq-gan-group-fsq-2x1024.pth",
+                "checkpoints/fish-speech-1.2-sft/firefly-gan-vq-fsq-4x1024-42hz-generator.pth",
             ]
         )
 
@@ -608,14 +485,9 @@ def train_process(
                 "16",
             ]
         )
-        ckpt_path = (
-            "text2semantic-sft-medium-v1.1-4k.pth"
-            if llama_base_config == "dual_ar_2_codebook_medium"
-            else "text2semantic-sft-large-v1.1-4k.pth"
-        )
+        ckpt_path = "checkpoints/fish-speech-1.2-sft/model.pth"
         lora_prefix = "lora_" if llama_use_lora else ""
-        llama_size = "large_" if ("large" in llama_base_config) else "medium_"
-        llama_name = lora_prefix + "text2semantic_" + llama_size + new_project
+        llama_name = lora_prefix + "text2semantic_" + new_project
         latest = next(
             iter(
                 sorted(
@@ -644,10 +516,7 @@ def train_process(
             "--config-name",
             "text2semantic_finetune",
             f"project={project}",
-            f"ckpt_path=checkpoints/{ckpt_path}",
             f"trainer.strategy.process_group_backend={backend}",
-            f"model@model.model={llama_base_config}",
-            "tokenizer.pretrained_model_name_or_path=checkpoints",
             f"train_dataset.proto_files={str(['data/quantized-dataset-ft'])}",
             f"val_dataset.proto_files={str(['data/quantized-dataset-ft'])}",
             f"model.optimizer.lr={llama_lr}",
@@ -658,8 +527,8 @@ def train_process(
             f"trainer.precision={llama_precision}",
             f"trainer.val_check_interval={llama_check_interval}",
             f"trainer.accumulate_grad_batches={llama_grad_batches}",
-            f"train_dataset.use_speaker={llama_use_speaker}",
-        ] + ([f"+lora@model.lora_config=r_8_alpha_16"] if llama_use_lora else [])
+            f"train_dataset.interactive_prob={llama_use_speaker}",
+        ] + ([f"+lora@model.model.lora_config=r_8_alpha_16"] if llama_use_lora else [])
         logger.info(train_cmd)
         subprocess.run(train_cmd)
 
@@ -708,29 +577,26 @@ def fresh_tb_dir():
 
 
 def list_decoder_models():
-    paths = (
-        [str(p) for p in Path("checkpoints").glob("vits*.*")]
-        + [str(p) for p in Path("checkpoints").glob("vq*.*")]
-        + [str(p) for p in Path("results").glob("vqgan*/**/*.ckpt")]
-        + [str(p) for p in Path("results").glob("vits*/**/*.ckpt")]
-    )
+    paths = [str(p) for p in Path("checkpoints").glob("fish*/firefly*.pth")]
     if not paths:
         logger.warning("No decoder model found")
     return paths
 
 
 def list_llama_models():
-    choices = [
-        str(p).replace("\\", "/") for p in Path("checkpoints").glob("text2sem*.*")
-    ]
-    choices += [str(p) for p in Path("results").glob("text2sem*/**/*.ckpt")]
+    choices = [str(p.parent) for p in Path("checkpoints").glob("merged*/*model*.pth")]
+    choices += [str(p.parent) for p in Path("checkpoints").glob("fish*/*model*.pth")]
+    choices += [str(p.parent) for p in Path("checkpoints").glob("fs*/*model*.pth")]
+    choices = sorted(choices, reverse=True)
     if not choices:
         logger.warning("No LLaMA model found")
     return choices
 
 
 def list_lora_llama_models():
-    choices = [str(p) for p in Path("results").glob("lora*/**/*.ckpt")]
+    choices = sorted(
+        [str(p) for p in Path("results").glob("lora*/**/*.ckpt")], reverse=True
+    )
     if not choices:
         logger.warning("No LoRA LLaMA model found")
     return choices
@@ -738,20 +604,6 @@ def list_lora_llama_models():
 
 def fresh_decoder_model():
     return gr.Dropdown(choices=list_decoder_models())
-
-
-def fresh_vqgan_ckpt():
-    return gr.Dropdown(
-        choices=[i18n("latest"), i18n("new")]
-        + [str(p) for p in Path("results").glob("vqgan_*/")]
-    )
-
-
-def fresh_vits_ckpt():
-    return gr.Dropdown(
-        choices=[i18n("latest"), i18n("new")]
-        + [str(p) for p in Path("results").glob("vits_*/")]
-    )
 
 
 def fresh_llama_ckpt(llama_use_lora):
@@ -766,11 +618,7 @@ def fresh_llama_ckpt(llama_use_lora):
 
 
 def fresh_llama_model():
-    choices = [
-        str(p).replace("\\", "/") for p in Path("checkpoints").glob("text2sem*.*")
-    ]
-    choices += [str(p) for p in Path("results").glob("text2sem*/**/*.ckpt")]
-    return gr.Dropdown(choices=choices)
+    return gr.Dropdown(choices=list_llama_models())
 
 
 def llama_lora_merge(llama_weight, lora_llama_config, lora_weight, llama_lora_output):
@@ -784,29 +632,60 @@ def llama_lora_merge(llama_weight, lora_llama_config, lora_weight, llama_lora_ou
                 "Path error, please check the model file exists in the corresponding path"
             )
         )
-
+    gr.Warning("Merging begins...")
     merge_cmd = [
         PYTHON,
         "tools/llama/merge_lora.py",
-        "--llama-config",
-        lora_llama_config,
         "--lora-config",
         "r_8_alpha_16",
-        "--llama-weight",
-        llama_weight,
         "--lora-weight",
         lora_weight,
         "--output",
-        llama_lora_output,
+        llama_lora_output + "_" + generate_folder_name(),
     ]
     logger.info(merge_cmd)
     subprocess.run(merge_cmd)
     return build_html_ok_message(i18n("Merge successfully"))
 
 
+def llama_quantify(llama_weight, quantify_mode):
+    if llama_weight is None or not Path(llama_weight).exists():
+        return build_html_error_message(
+            i18n(
+                "Path error, please check the model file exists in the corresponding path"
+            )
+        )
+
+    gr.Warning("Quantifying begins...")
+
+    now = generate_folder_name()
+    quantify_cmd = [
+        PYTHON,
+        "tools/llama/quantize.py",
+        "--checkpoint-path",
+        llama_weight,
+        "--mode",
+        quantify_mode,
+        "--timestamp",
+        now,
+    ]
+    logger.info(quantify_cmd)
+    subprocess.run(quantify_cmd)
+    if quantify_mode == "int8":
+        quantize_path = str(
+            Path(os.getcwd()) / "checkpoints" / f"fs-1.2-{quantify_mode}-{now}"
+        )
+    else:
+        quantize_path = str(
+            Path(os.getcwd()) / "checkpoints" / f"fs-1.2-{quantify_mode}-g128-{now}"
+        )
+    return build_html_ok_message(
+        i18n("Quantify successfully") + f"Path: {quantize_path}"
+    )
+
+
 init_vqgan_yml = load_yaml_data_in_fact(vqgan_yml_path)
 init_llama_yml = load_yaml_data_in_fact(llama_yml_path)
-init_vits_yml = load_yaml_data_in_fact(vits_yml_path)
 
 with gr.Blocks(
     head="<style>\n" + css + "\n</style>",
@@ -839,30 +718,6 @@ with gr.Blocks(
                         if_label = gr.Checkbox(
                             label=i18n("Open Labeler WebUI"), scale=0, show_label=True
                         )
-                with gr.Row():
-                    min_duration = gr.Slider(
-                        label=i18n("Minimum Audio Duration"),
-                        value=1.5,
-                        step=0.1,
-                        minimum=0.4,
-                        maximum=30,
-                    )
-                    max_duration = gr.Slider(
-                        label=i18n("Maximum Audio Duration"),
-                        value=30,
-                        step=0.1,
-                        minimum=0.4,
-                        maximum=30,
-                    )
-
-                with gr.Row():
-                    add_button = gr.Button(
-                        "\U000027A1 " + i18n("Add to Processing Area"),
-                        variant="primary",
-                    )
-                    remove_button = gr.Button(
-                        "\U000026D4 " + i18n("Remove Selected Data")
-                    )
 
                 with gr.Row():
                     label_device = gr.Dropdown(
@@ -876,11 +731,9 @@ with gr.Blocks(
                     )
                     label_model = gr.Dropdown(
                         label=i18n("Whisper Model"),
-                        info=i18n(
-                            "Use large for 10G+ GPU, medium for 5G, small for 2G"
-                        ),
-                        choices=["large", "medium", "small"],
-                        value="small",
+                        info=i18n("Faster Whisper, Up to 5g GPU memory usage"),
+                        choices=["large-v3", "medium"],
+                        value="large-v3",
                         interactive=True,
                     )
                     label_radio = gr.Dropdown(
@@ -889,13 +742,39 @@ with gr.Blocks(
                             "If there is no corresponding text for the audio, apply ASR for assistance, support .txt or .lab format"
                         ),
                         choices=[
-                            (i18n("Chinese"), "ZH"),
-                            (i18n("English"), "EN"),
-                            (i18n("Japanese"), "JA"),
+                            (i18n("Chinese"), "zh"),
+                            (i18n("English"), "en"),
+                            (i18n("Japanese"), "ja"),
                             (i18n("Disabled"), "IGNORE"),
+                            (i18n("auto"), "auto"),
                         ],
                         value="IGNORE",
                         interactive=True,
+                    )
+
+                with gr.Row():
+                    if_initial_prompt = gr.Checkbox(
+                        value=False,
+                        label=i18n("Enable Initial Prompt"),
+                        min_width=120,
+                        scale=0,
+                    )
+                    initial_prompt = gr.Textbox(
+                        label=i18n("Initial Prompt"),
+                        info=i18n(
+                            "Initial prompt can provide contextual or vocabulary-specific guidance to the model."
+                        ),
+                        placeholder="This audio introduces the basic concepts and applications of artificial intelligence and machine learning.",
+                        interactive=False,
+                    )
+
+                with gr.Row():
+                    add_button = gr.Button(
+                        "\U000027A1 " + i18n("Add to Processing Area"),
+                        variant="primary",
+                    )
+                    remove_button = gr.Button(
+                        "\U000026D4 " + i18n("Remove Selected Data")
                     )
 
             with gr.Tab("\U0001F6E0 " + i18n("Training Configuration")):
@@ -905,166 +784,15 @@ with gr.Blocks(
                             "Select the model to be trained (Depending on the Tab page you are on)"
                         ),
                         interactive=False,
-                        choices=["VQGAN", "VITS", "LLAMA"],
+                        choices=["VQGAN", "LLAMA"],
                         value="VQGAN",
                     )
                 with gr.Row():
                     with gr.Tabs():
                         with gr.Tab(label=i18n("VQGAN Configuration")) as vqgan_page:
-                            with gr.Row(equal_height=False):
-                                vqgan_ckpt = gr.Dropdown(
-                                    label=i18n("Select VQGAN ckpt"),
-                                    choices=[i18n("latest"), i18n("new")]
-                                    + [
-                                        str(p) for p in Path("results").glob("vqgan_*/")
-                                    ],
-                                    value=i18n("latest"),
-                                    interactive=True,
-                                )
-                            with gr.Row(equal_height=False):
-                                vqgan_lr_slider = gr.Slider(
-                                    label=i18n("Initial Learning Rate"),
-                                    interactive=True,
-                                    minimum=1e-5,
-                                    maximum=1e-4,
-                                    step=1e-5,
-                                    value=init_vqgan_yml["model"]["optimizer"]["lr"],
-                                )
-                                vqgan_maxsteps_slider = gr.Slider(
-                                    label=i18n("Maximum Training Steps"),
-                                    interactive=True,
-                                    minimum=1000,
-                                    maximum=100000,
-                                    step=1000,
-                                    value=init_vqgan_yml["trainer"]["max_steps"],
-                                )
+                            gr.HTML("You don't need to train this model!")
 
-                            with gr.Row(equal_height=False):
-                                vqgan_data_num_workers_slider = gr.Slider(
-                                    label=i18n("Number of Workers"),
-                                    interactive=True,
-                                    minimum=1,
-                                    maximum=16,
-                                    step=1,
-                                    value=init_vqgan_yml["data"]["num_workers"],
-                                )
-
-                                vqgan_data_batch_size_slider = gr.Slider(
-                                    label=i18n("Batch Size"),
-                                    interactive=True,
-                                    minimum=1,
-                                    maximum=32,
-                                    step=1,
-                                    value=init_vqgan_yml["data"]["batch_size"],
-                                )
-                            with gr.Row(equal_height=False):
-                                vqgan_data_val_batch_size_slider = gr.Slider(
-                                    label=i18n("Validation Batch Size"),
-                                    interactive=True,
-                                    minimum=1,
-                                    maximum=32,
-                                    step=1,
-                                    value=init_vqgan_yml["data"]["val_batch_size"],
-                                )
-                                vqgan_precision_dropdown = gr.Dropdown(
-                                    label=i18n("Precision"),
-                                    interactive=True,
-                                    choices=["32", "bf16-true", "bf16-mixed"],
-                                    info=i18n(
-                                        "bf16-true is recommended for 30+ series GPU, 16-mixed is recommended for 10+ series GPU"
-                                    ),
-                                    value=str(init_vqgan_yml["trainer"]["precision"]),
-                                )
-                            with gr.Row(equal_height=False):
-                                vqgan_check_interval_slider = gr.Slider(
-                                    label=i18n("Save model every n steps"),
-                                    interactive=True,
-                                    minimum=500,
-                                    maximum=10000,
-                                    step=500,
-                                    value=init_vqgan_yml["trainer"][
-                                        "val_check_interval"
-                                    ],
-                                )
-
-                        with gr.Tab(label=i18n("VITS Configuration")) as vits_page:
-                            with gr.Row(equal_height=False):
-                                vits_ckpt = gr.Dropdown(
-                                    label=i18n("Select VITS ckpt"),
-                                    choices=[i18n("latest"), i18n("new")]
-                                    + [str(p) for p in Path("results").glob("vits_*/")],
-                                    value=i18n("latest"),
-                                    interactive=True,
-                                )
-                            with gr.Row(equal_height=False):
-                                vits_lr_slider = gr.Slider(
-                                    label=i18n("Initial Learning Rate"),
-                                    interactive=True,
-                                    minimum=1e-5,
-                                    maximum=1e-4,
-                                    step=1e-5,
-                                    value=init_vits_yml["model"]["optimizer"]["lr"],
-                                )
-                                vits_maxsteps_slider = gr.Slider(
-                                    label=i18n("Maximum Training Steps"),
-                                    interactive=True,
-                                    minimum=1000,
-                                    maximum=100000,
-                                    step=1000,
-                                    value=init_vits_yml["trainer"]["max_steps"],
-                                )
-
-                            with gr.Row(equal_height=False):
-                                vits_data_num_workers_slider = gr.Slider(
-                                    label=i18n("Number of Workers"),
-                                    interactive=True,
-                                    minimum=1,
-                                    maximum=16,
-                                    step=1,
-                                    value=init_vits_yml["data"]["num_workers"],
-                                )
-
-                                vits_data_batch_size_slider = gr.Slider(
-                                    label=i18n("Batch Size"),
-                                    interactive=True,
-                                    minimum=1,
-                                    maximum=32,
-                                    step=1,
-                                    value=init_vits_yml["data"]["batch_size"],
-                                )
-                            with gr.Row(equal_height=False):
-                                vits_data_val_batch_size_slider = gr.Slider(
-                                    label=i18n("Validation Batch Size"),
-                                    interactive=True,
-                                    minimum=1,
-                                    maximum=32,
-                                    step=1,
-                                    value=init_vits_yml["data"]["val_batch_size"],
-                                )
-                                vits_precision_dropdown = gr.Dropdown(
-                                    label=i18n("Precision"),
-                                    interactive=True,
-                                    choices=["32", "bf16-mixed"],
-                                    info=i18n(
-                                        "16-mixed is recommended for 10+ series GPU"
-                                    ),
-                                    value=str(init_vits_yml["trainer"]["precision"]),
-                                )
-                            with gr.Row(equal_height=False):
-                                vits_check_interval_slider = gr.Slider(
-                                    label=i18n("Save model every n steps"),
-                                    interactive=True,
-                                    minimum=1,
-                                    maximum=2000,
-                                    step=1,
-                                    value=init_vits_yml["trainer"][
-                                        "val_check_interval"
-                                    ],
-                                )
-
-                        with gr.Tab(
-                            label=i18n("LLAMA Configuration"), id=3
-                        ) as llama_page:
+                        with gr.Tab(label=i18n("LLAMA Configuration")) as llama_page:
                             with gr.Row(equal_height=False):
                                 llama_use_lora = gr.Checkbox(
                                     label=i18n("Use LoRA"),
@@ -1072,6 +800,7 @@ with gr.Blocks(
                                         "Use LoRA can save GPU memory, but may reduce the quality of the model"
                                     ),
                                     value=True,
+                                    interactive=False,
                                 )
                                 llama_ckpt = gr.Dropdown(
                                     label=i18n("Select LLAMA ckpt"),
@@ -1105,10 +834,9 @@ with gr.Blocks(
                                 llama_base_config = gr.Dropdown(
                                     label=i18n("Model Size"),
                                     choices=[
-                                        "dual_ar_2_codebook_large",
-                                        "dual_ar_2_codebook_medium",
+                                        "text2semantic_finetune",
                                     ],
-                                    value="dual_ar_2_codebook_medium",
+                                    value="text2semantic_finetune",
                                 )
                                 llama_data_num_workers_slider = gr.Slider(
                                     label=i18n("Number of Workers"),
@@ -1178,7 +906,7 @@ with gr.Blocks(
                                     maximum=1.0,
                                     step=0.05,
                                     value=init_llama_yml["train_dataset"][
-                                        "use_speaker"
+                                        "interactive_prob"
                                     ],
                                 )
 
@@ -1190,10 +918,9 @@ with gr.Blocks(
                                         "Type the path or select from the dropdown"
                                     ),
                                     choices=[
-                                        "checkpoints/text2semantic-sft-large-v1.1-4k.pth",
-                                        "checkpoints/text2semantic-sft-medium-v1.1-4k.pth",
+                                        "checkpoints/fish-speech-1.2-sft/model.pth",
                                     ],
-                                    value=init_llama_yml["ckpt_path"],
+                                    value="checkpoints/fish-speech-1.2-sft/model.pth",
                                     allow_custom_value=True,
                                     interactive=True,
                                 )
@@ -1216,10 +943,9 @@ with gr.Blocks(
                                         "Type the path or select from the dropdown"
                                     ),
                                     choices=[
-                                        "dual_ar_2_codebook_large",
-                                        "dual_ar_2_codebook_medium",
+                                        "text2semantic_finetune",
                                     ],
-                                    value="dual_ar_2_codebook_medium",
+                                    value="text2semantic_finetune",
                                     allow_custom_value=True,
                                 )
                             with gr.Row(equal_height=False):
@@ -1228,8 +954,8 @@ with gr.Blocks(
                                     info=i18n(
                                         "Type the path or select from the dropdown"
                                     ),
-                                    value="checkpoints/merged.ckpt",
-                                    choices=["checkpoints/merged.ckpt"],
+                                    value="checkpoints/merged",
+                                    choices=["checkpoints/merged"],
                                     allow_custom_value=True,
                                     interactive=True,
                                 )
@@ -1238,7 +964,34 @@ with gr.Blocks(
                                     value=i18n("Merge"), variant="primary"
                                 )
 
-                        with gr.Tab(label="Tensorboard", id=5):
+                        with gr.Tab(label=i18n("Model Quantization"), id=5):
+                            with gr.Row(equal_height=False):
+                                llama_weight_to_quantify = gr.Dropdown(
+                                    label=i18n("Base LLAMA Model"),
+                                    info=i18n(
+                                        "Type the path or select from the dropdown"
+                                    ),
+                                    choices=list_llama_models(),
+                                    value="checkpoints/fish-speech-1.2-sft",
+                                    allow_custom_value=True,
+                                    interactive=True,
+                                )
+                                quantify_mode = gr.Dropdown(
+                                    label=i18n("Post-quantification Precision"),
+                                    info=i18n(
+                                        "The lower the quantitative precision, the more the effectiveness may decrease, but the greater the efficiency will increase"
+                                    ),
+                                    choices=["int8", "int4"],
+                                    value="int8",
+                                    allow_custom_value=False,
+                                    interactive=True,
+                                )
+                            with gr.Row(equal_height=False):
+                                llama_quantify_btn = gr.Button(
+                                    value=i18n("Quantify"), variant="primary"
+                                )
+
+                        with gr.Tab(label="Tensorboard", id=6):
                             with gr.Row(equal_height=False):
                                 tb_host = gr.Textbox(
                                     label=i18n("Tensorboard Host"), value="127.0.0.1"
@@ -1282,18 +1035,15 @@ with gr.Blocks(
                                         "Type the path or select from the dropdown"
                                     ),
                                     choices=list_decoder_models(),
-                                    value=init_vits_yml["ckpt_path"],
+                                    value="checkpoints/fish-speech-1.2-sft/firefly-gan-vq-fsq-4x1024-42hz-generator.pth",
                                     allow_custom_value=True,
                                 )
                                 infer_decoder_config = gr.Dropdown(
                                     label=i18n("Decoder Model Config"),
                                     info=i18n("Changing with the Model Path"),
-                                    value="vits_decoder_finetune",
+                                    value="firefly_gan_vq",
                                     choices=[
-                                        "vits_decoder_finetune",
-                                        "vits_decoder_pretrain",
-                                        "vqgan_finetune",
-                                        "vqgan_pretrain",
+                                        "firefly_gan_vq",
                                     ],
                                     allow_custom_value=True,
                                 )
@@ -1303,20 +1053,11 @@ with gr.Blocks(
                                     info=i18n(
                                         "Type the path or select from the dropdown"
                                     ),
-                                    value=init_llama_yml["ckpt_path"],
+                                    value="checkpoints/fish-speech-1.2-sft",
                                     choices=list_llama_models(),
                                     allow_custom_value=True,
                                 )
-                                infer_llama_config = gr.Dropdown(
-                                    label=i18n("LLAMA Model Config"),
-                                    info=i18n("Changing with the Model Path"),
-                                    choices=[
-                                        "dual_ar_2_codebook_large",
-                                        "dual_ar_2_codebook_medium",
-                                    ],
-                                    value="dual_ar_2_codebook_medium",
-                                    allow_custom_value=True,
-                                )
+
                             with gr.Row():
                                 infer_compile = gr.Radio(
                                     label=i18n("Compile Model"),
@@ -1388,11 +1129,10 @@ with gr.Blocks(
     )
     gr.HTML(footer, elem_id="footer")
     vqgan_page.select(lambda: "VQGAN", None, model_type_radio)
-    vits_page.select(lambda: "VITS", None, model_type_radio)
     llama_page.select(lambda: "LLAMA", None, model_type_radio)
     add_button.click(
         fn=add_item,
-        inputs=[textbox, output_radio, label_radio],
+        inputs=[textbox, output_radio, label_radio, if_initial_prompt, initial_prompt],
         outputs=[checkbox_group, error],
     )
     remove_button.click(
@@ -1405,32 +1145,16 @@ with gr.Blocks(
         'toolbar=no, menubar=no, scrollbars=no, resizable=no, location=no, status=no")}',
     )
     if_label.change(fn=change_label, inputs=[if_label], outputs=[error])
-
+    if_initial_prompt.change(
+        fn=lambda x: gr.Textbox(value="", interactive=x),
+        inputs=[if_initial_prompt],
+        outputs=[initial_prompt],
+    )
     train_btn.click(
         fn=train_process,
         inputs=[
             train_box,
             model_type_radio,
-            min_duration,
-            max_duration,
-            # vq-gan config
-            vqgan_ckpt,
-            vqgan_lr_slider,
-            vqgan_maxsteps_slider,
-            vqgan_data_num_workers_slider,
-            vqgan_data_batch_size_slider,
-            vqgan_data_val_batch_size_slider,
-            vqgan_precision_dropdown,
-            vqgan_check_interval_slider,
-            # vits config
-            vits_ckpt,
-            vits_lr_slider,
-            vits_maxsteps_slider,
-            vits_data_num_workers_slider,
-            vits_data_batch_size_slider,
-            vits_data_val_batch_size_slider,
-            vits_precision_dropdown,
-            vits_check_interval_slider,
             # llama config
             llama_ckpt,
             llama_base_config,
@@ -1454,14 +1178,6 @@ with gr.Blocks(
     )
     tb_dir.change(fn=fresh_tb_dir, inputs=[], outputs=[tb_dir])
     infer_decoder_model.change(
-        fn=change_decoder_config,
-        inputs=[infer_decoder_model],
-        outputs=[infer_decoder_config],
-    )
-    infer_llama_model.change(
-        fn=change_llama_config, inputs=[infer_llama_model], outputs=[infer_llama_config]
-    )
-    infer_decoder_model.change(
         fn=fresh_decoder_model, inputs=[], outputs=[infer_decoder_model]
     )
     infer_llama_model.change(
@@ -1476,16 +1192,11 @@ with gr.Blocks(
     fresh_btn.click(
         fn=new_explorer, inputs=[train_box, tree_slider], outputs=[file_markdown]
     )
-    vqgan_ckpt.change(fn=fresh_vqgan_ckpt, inputs=[], outputs=[vqgan_ckpt])
-    vits_ckpt.change(fn=fresh_vits_ckpt, inputs=[], outputs=[vits_ckpt])
     llama_use_lora.change(
         fn=fresh_llama_ckpt, inputs=[llama_use_lora], outputs=[llama_ckpt]
     )
     llama_ckpt.change(
         fn=fresh_llama_ckpt, inputs=[llama_use_lora], outputs=[llama_ckpt]
-    )
-    lora_weight.change(
-        fn=change_llama_config, inputs=[lora_weight], outputs=[lora_llama_config]
     )
     lora_weight.change(
         fn=lambda: gr.Dropdown(choices=list_lora_llama_models()),
@@ -1497,6 +1208,11 @@ with gr.Blocks(
         inputs=[llama_weight, lora_llama_config, lora_weight, llama_lora_output],
         outputs=[train_error],
     )
+    llama_quantify_btn.click(
+        fn=llama_quantify,
+        inputs=[llama_weight_to_quantify, quantify_mode],
+        outputs=[train_error],
+    )
     infer_checkbox.change(
         fn=change_infer,
         inputs=[
@@ -1506,7 +1222,6 @@ with gr.Blocks(
             infer_decoder_model,
             infer_decoder_config,
             infer_llama_model,
-            infer_llama_config,
             infer_compile,
         ],
         outputs=[infer_error],

@@ -1,18 +1,27 @@
 import argparse
 import base64
 import json
+from pathlib import Path
 
 import pyaudio
 import requests
 
 
 def wav_to_base64(file_path):
-    if not file_path:
+    if not file_path or not Path(file_path).exists():
         return None
     with open(file_path, "rb") as wav_file:
         wav_content = wav_file.read()
         base64_encoded = base64.b64encode(wav_content)
         return base64_encoded.decode("utf-8")
+
+
+def read_ref_text(ref_text):
+    path = Path(ref_text)
+    if path.exists() and path.is_file():
+        with path.open("r", encoding="utf-8") as file:
+            return file.read()
+    return ref_text
 
 
 def play_audio(audio_content, format, channels, rate):
@@ -30,7 +39,11 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--url", "-u", type=str, required=True, help="URL of the server"
+        "--url",
+        "-u",
+        type=str,
+        default="http://127.0.0.1:8080/v1/invoke",
+        help="URL of the server",
     )
     parser.add_argument(
         "--text", "-t", type=str, required=True, help="Text to be synthesized"
@@ -39,21 +52,24 @@ if __name__ == "__main__":
         "--reference_audio",
         "-ra",
         type=str,
-        required=False,
+        default=None,
         help="Path to the WAV file",
     )
     parser.add_argument(
         "--reference_text",
         "-rt",
         type=str,
-        required=False,
+        default=None,
         help="Reference text for voice synthesis",
     )
     parser.add_argument(
-        "--max_new_tokens", type=int, default=0, help="Maximum new tokens to generate"
+        "--max_new_tokens",
+        type=int,
+        default=1024,
+        help="Maximum new tokens to generate",
     )
     parser.add_argument(
-        "--chunk_length", type=int, default=150, help="Chunk length for synthesis"
+        "--chunk_length", type=int, default=100, help="Chunk length for synthesis"
     )
     parser.add_argument(
         "--top_p", type=float, default=0.7, help="Top-p sampling for synthesis"
@@ -61,7 +77,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--repetition_penalty",
         type=float,
-        default=1.5,
+        default=1.2,
         help="Repetition penalty for synthesis",
     )
     parser.add_argument(
@@ -70,6 +86,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--speaker", type=str, default=None, help="Speaker ID for voice synthesis"
     )
+    parser.add_argument("--emotion", type=str, default=None, help="Speaker's Emotion")
     parser.add_argument("--format", type=str, default="wav", help="Audio format")
     parser.add_argument(
         "--streaming", type=bool, default=False, help="Enable streaming response"
@@ -83,9 +100,13 @@ if __name__ == "__main__":
 
     base64_audio = wav_to_base64(args.reference_audio)
 
+    ref_text = args.reference_text
+    if ref_text:
+        ref_text = read_ref_text(ref_text)
+
     data = {
         "text": args.text,
-        "reference_text": args.reference_text,
+        "reference_text": ref_text,
         "reference_audio": base64_audio,
         "max_new_tokens": args.max_new_tokens,
         "chunk_length": args.chunk_length,
@@ -93,6 +114,7 @@ if __name__ == "__main__":
         "repetition_penalty": args.repetition_penalty,
         "temperature": args.temperature,
         "speaker": args.speaker,
+        "emotion": args.emotion,
         "format": args.format,
         "streaming": args.streaming,
     }
