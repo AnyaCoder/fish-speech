@@ -8,8 +8,8 @@ import wave
 from argparse import ArgumentParser
 from http import HTTPStatus
 from pathlib import Path
-from typing import Annotated, Any
-
+from typing import Annotated, Any, Coroutine
+import pyaudio
 import librosa
 import numpy as np
 import ormsgpack
@@ -29,6 +29,7 @@ from kui.asgi import (
     OpenAPI,
     StreamResponse,
     request,
+    websocket
 )
 from kui.asgi.routing import MultimethodRoutes
 from loguru import logger
@@ -58,6 +59,7 @@ from tools.llama.generate import (
     launch_thread_safe_queue,
     launch_thread_safe_queue_agent,
 )
+from fish_speech.conversation import Conversation, Message
 from tools.schema import (
     GLOBAL_NUM_SAMPLES,
     ASRPackRequest,
@@ -376,7 +378,13 @@ def api_invoke_asr(payload: Annotated[ServeASRRequest, Body(exclusive=True)]):
     )
 
 
-from fish_speech.conversation import Conversation, Message
+def load_asr_model(*, device="cuda", hub="ms"):
+    return AutoModel(
+        model="iic/SenseVoiceSmall",
+        device=device,
+        disable_pbar=True,
+        hub=hub,
+    )
 
 
 def execute_request(
@@ -843,15 +851,165 @@ app = Kui(
 )
 
 
-def load_asr_model(*, device="cuda", hub="ms"):
-    return AutoModel(
-        model="iic/SenseVoiceSmall",
-        device=device,
-        disable_pbar=True,
-        hub=hub,
-    )
+
+import asyncio
+import threading
+import websockets
+from silero_vad import VADIterator
+SAMPLING_RATE= 16000
+SILENCE_THRESHOLD = 0.2
+from matplotlib import pyplot as plt
+from enum import Enum
+
+# 定义状态枚举
+class State(Enum):
+    IDLE = 1       # 空闲状态，等待语音
+    ACTIVE = 2     # 语音检测状态
+    INACTIVE = 3   # 语音结束状态（静默状态）
+
+class StateMachine:
+    def __init__(self):
+        self.state = State.IDLE  # 初始化为空闲状态
+        self.threshold = 0.3
+        self.answer = []
+        self.bytes = bytes()
+        self.miss_count = 0  # 计数器：连续未满足阈值的次数
+
+    def process(self, number, chunk_np: np.ndarray):
+        chunk_bytes = chunk_np.astype(np.int16).tobytes()
+        if self.state == State.IDLE:
+            if number < self.threshold:
+                pass
+            else:
+                self.state = State.ACTIVE
+                self.answer.append(number)
+                self.bytes += chunk_bytes
+        elif self.state == State.ACTIVE:
+            if number < self.threshold:
+                self.state = State.INACTIVE
+            self.answer.append(number)
+            self.bytes += chunk_bytes
+        elif self.state == State.INACTIVE:
+            if number >= self.threshold:
+                self.state = State.ACTIVE
+                self.miss_count = 0  # 重置计数器
+                self.bytes += chunk_bytes
+            else:
+                self.miss_count += 1  # 连续未满足阈值，计数器加1
+                self.bytes += chunk_bytes
+                if self.miss_count >= 3:  # 连续3次不满足阈值
+                    self.state = State.IDLE
+                    if len(self.answer) > 9:
+                        yield self.answer.copy(), self.bytes
+                    self.answer.clear()
+                    self.bytes = b""
+                    self.miss_count = 0  # 重置计数器
+            self.answer.append(number)
+
+    def get_result(self, input_num, chunk_np):
+        yield from self.process(input_num, chunk_np)
+                                
+# WebSocket处理函数
+async def audio_handler(websocket, path):
+
+    async for audio_bytes in websocket:
+        # print(f"Received audio data of length: {len(audio_bytes)}")
+        audio_np_original = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32)
+        audio_np = audio_np_original / 32767
+        audio_resampled_original = librosa.resample(audio_np_original, orig_sr=44100, target_sr=SAMPLING_RATE)
+        audio_resampled = librosa.resample(audio_np, orig_sr=44100, target_sr=SAMPLING_RATE)
+        
+        window_size_samples = 512 if SAMPLING_RATE == 16000 else 256
+
+        for i in range(0, len(audio_resampled), window_size_samples):
+            chunk_np_original = audio_resampled_original[i:i+window_size_samples]
+            chunk_np = audio_resampled[i:i+window_size_samples]
+            if len(chunk_np) < window_size_samples:
+                break
+            chunk = torch.Tensor(chunk_np)
+            speech_prob = vad_model(chunk, SAMPLING_RATE).item()
+
+            if speech_prob:
+                # print(f"Speech prob: {speech_prob * 100:.2f}%")
+                iter = state_machine.get_result(speech_prob, chunk_np_original)
+                for it, _bytes in iter:
+                    rounded_it = [round(x, 2) for x in it]
+                    print("len: ", len(rounded_it), ", probs: ", rounded_it, " len: ", len(_bytes))
+                    stream.write(_bytes)
+
+        vad_iterator.reset_states()  # reset model states after each audio
 
 
+async def start_websocket_server():
+    host = "localhost"
+    port = 8765
+    start_server = websockets.serve(audio_handler, host, port)
+    await start_server
+    logger.info(f"WebSocket server started at ws://{host}:{port}")
+    await asyncio.Future()  # run forever until the task is cancelled
+
+def run_server_in_thread(async_task: Coroutine):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop) 
+    loop.run_until_complete(async_task)
+
+# 用于线程通信的队列
+data_queue = queue.Queue()
+
+# 创建图表函数
+def create_plot():
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.set_xlim(0, 10)  # 横坐标范围：0-10秒
+    ax.set_ylim(0, 1)  # 纵坐标范围：0到1的概率
+    line, = ax.plot([], [], label="Speech Probability")  # 创建图线
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Speech Probability")
+    ax.legend()
+    
+    return fig, ax, line
+
+# 更新图表函数
+def update_plot(fig: plt.Figure, ax: plt.Axes, line: plt.Line2D, times: list, speech_probs: list):
+    # 更新数据并重新绘制图表
+    line.set_xdata(times)
+    line.set_ydata(speech_probs)
+
+    ax.draw_artist(ax.patch)  # 重绘背景
+    ax.draw_artist(line)  # 只重绘线条部分
+
+    fig.canvas.flush_events()
+    plt.pause(0.01)
+
+
+def plot_graph():
+    # 创建图表
+    fig, ax, line = create_plot()
+
+    plt.ion()
+    fig.canvas.draw()
+
+    times = []  # 时间轴
+    speech_probs = []  # 语音概率
+
+    while True:
+        try:
+            current_time, speech_prob = data_queue.get(timeout=1)  # 获取新的数据点
+        except queue.Empty:
+            continue  # 如果队列为空，继续等待
+
+        # 添加新的数据点
+        times.append(current_time)
+        speech_probs.append(speech_prob)
+
+        # 如果超过10秒，删除最早的点
+        if len(times) > 300:
+            times = times[1:]
+            speech_probs = speech_probs[1:]
+
+        # 更新图表
+        update_plot(fig, ax, line, times, speech_probs)
+    
 # Each worker process created by Uvicorn has its own memory space,
 # meaning that models and variables are not shared between processes.
 # Therefore, any global variables (like `llama_queue` or `decoder_model`)
@@ -864,9 +1022,12 @@ def load_asr_model(*, device="cuda", hub="ms"):
 @app.on_startup
 def initialize_app(app: Kui):
 
-    global args, llama_queue, tokenizer, config, decoder_model, vad_model, asr_model, prompt_tokens, prompt_texts
-
+    global args, llama_queue, tokenizer, config, decoder_model, vad_model,\
+          asr_model, prompt_tokens, prompt_texts, vad_iterator, state_machine, stream
+   
     prompt_tokens, prompt_texts = [], []
+
+    state_machine = StateMachine()
 
     args = parse_args()  # args same as ones in other processes
     args.precision = torch.half if args.half else torch.bfloat16
@@ -905,6 +1066,20 @@ def initialize_app(app: Kui):
     vad_model = load_silero_vad()
 
     logger.info("VAD model loaded, warming up...")
+
+    ws_server_thread = threading.Thread(target=run_server_in_thread, args=[start_websocket_server()], daemon=True)
+    ws_server_thread.start()
+    # plot_thread = threading.Thread(target=plot_graph, daemon=True)
+    # plot_thread.start()
+
+    vad_iterator = VADIterator(vad_model, sampling_rate=SAMPLING_RATE)
+    logger.info("WebSocket server is running in a separate thread...")
+    
+    p = pyaudio.PyAudio()
+    audio_format = pyaudio.paInt16  # Assuming 16-bit PCM format
+    stream = p.open(
+        format=audio_format, channels=1, rate=16000, output=True
+    )
 
     if args.mode == "tts":
         # Dry run to ensure models work and avoid first-time latency
