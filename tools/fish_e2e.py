@@ -33,26 +33,14 @@ class CustomAudioFrame:
             )
 
         self._data = bytearray(data)
-        self._sample_rate = sample_rate
-        self._num_channels = num_channels
-        self._samples_per_channel = samples_per_channel
+        self.sample_rate = sample_rate
+        self.num_channels = num_channels
+        self.samples_per_channel = samples_per_channel
 
     @property
     def data(self):
         return memoryview(self._data).cast("h")
-
-    @property
-    def sample_rate(self):
-        return self._sample_rate
-
-    @property
-    def num_channels(self):
-        return self._num_channels
-
-    @property
-    def samples_per_channel(self):
-        return self._samples_per_channel
-
+    
     @property
     def duration(self):
         return self.samples_per_channel / self.sample_rate
