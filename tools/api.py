@@ -1,5 +1,6 @@
 import io
 import os
+os.environ["MODELSCOPE_CACHE"] = os.path.join(os.environ.get("TEMP", "."), "funasr")
 import queue
 import re
 import time
@@ -65,7 +66,7 @@ from tools.schema import (
     ASRPackRequest,
     ServeASRRequest,
     ServeASRResponse,
-    ServeASRSegment,
+    ServeASRTranscription,
     ServeAudioPart,
     ServeForwardMessage,
     ServeMessage,
@@ -310,6 +311,12 @@ def api_vqgan_decode(payload: Annotated[ServeVQGANDecodeRequest, Body(exclusive=
         ServeVQGANDecodeResponse(audios=audios), option=ormsgpack.OPT_SERIALIZE_PYDANTIC
     )
 
+PROMPT = {
+    "zh": "人间灯火倒映湖中，她的渴望让静水泛起涟漪。若代价只是孤独，那就让这份愿望肆意流淌。",
+    "en": "In the realm of advanced technology, the evolution of artificial intelligence stands as a monumental achievement.",
+    "ja": "先進技術の領域において、人工知能の進化は画期的な成果として立っています。常に機械ができることの限界を押し広げているこのダイナミックな分野は、急速な成長と革新を見せています。複雑なデータパターンの解読から自動運転車の操縦まで、AIの応用は広範囲に及びます。",
+}
+
 
 @torch.no_grad()
 def batch_asr(model, audios, sr, language="auto"):
@@ -320,17 +327,22 @@ def batch_asr(model, audios, sr, language="auto"):
         resampled_audios.append(audio)
 
     with global_lock:
-        res = model.generate(
-            input=resampled_audios,
-            batch_size=len(resampled_audios),
-            language=language,
-            use_itn=True,
-        )
+        if language in PROMPT.keys():
+            res = model.generate(
+                input=resampled_audios,
+                batch_size=300,
+                hotword=PROMPT[language],
+                merge_vad=True,
+                merge_length_s=15,
+                use_itn=True,
+            )
+        else:
+            res = model.generate(input=resampled_audios, batch_size_s=300,use_itn=True)
 
     results = []
     for r, audio in zip(res, audios):
         text = r["text"]
-        text = re.sub(r"<\|.*?\|>", "", text)
+        text = re.sub(r"< \|.*?\| >", "", text).strip()
         duration = len(audio) / sr * 1000
         huge_gap = False
 
@@ -348,11 +360,11 @@ def batch_asr(model, audios, sr, language="auto"):
                 huge_gap = True
 
         results.append(
-            {
-                "text": text,
-                "duration": duration,
-                "huge_gap": huge_gap,
-            }
+            ServeASRTranscription(
+                text=text,
+                duration=duration,
+                huge_gap=huge_gap
+            )
         )
 
     return results
@@ -361,7 +373,7 @@ def batch_asr(model, audios, sr, language="auto"):
 @routes.http.post("/v1/asr")
 def api_invoke_asr(payload: Annotated[ServeASRRequest, Body(exclusive=True)]):
     start_time = time.time()
-    audios = [np.frombuffer(audio, dtype=np.float16) for audio in payload.audios]
+    audios = [(np.frombuffer(audio, dtype=np.int16).astype(np.float32).copy() / 32767) for audio in payload.audios]
     audios = [torch.from_numpy(audio).float() for audio in audios]
 
     if any(audios.shape[-1] >= 30 * payload.sample_rate for audios in audios):
@@ -372,18 +384,23 @@ def api_invoke_asr(payload: Annotated[ServeASRRequest, Body(exclusive=True)]):
     )
     logger.info(f"[EXEC] ASR time: {(time.time() - start_time) * 1000:.2f}ms")
 
-    return ormsgpack.packb(
+    packed = ormsgpack.packb(
         ServeASRResponse(transcriptions=transcriptions),
         option=ormsgpack.OPT_SERIALIZE_PYDANTIC,
     )
+
+    return packed
 
 
 def load_asr_model(*, device="cuda", hub="ms"):
     return AutoModel(
         model="iic/SenseVoiceSmall",
         device=device,
-        disable_pbar=True,
         hub=hub,
+        vad_model="fsmn-vad",
+        punc_model="ct-punc",
+        log_level="ERROR",
+        disable_pbar=True,
     )
 
 
@@ -791,7 +808,14 @@ async def api_health():
 def parse_args():
     parser = ArgumentParser()
     parser.add_argument("--mode", type=str, choices=["agent", "tts"], default="tts")
+    parser.add_argument("--fake-chat-mode", action="store_true")
     parser.add_argument("--load-asr-model", action="store_true")
+    parser.add_argument("--load-vad-model", action="store_true")
+    parser.add_argument("--load-listen-module", action="store_true")
+
+    parser.add_argument("--load-llama-model", action="store_true")
+    parser.add_argument("--load-decoder-model", action="store_true")
+
     parser.add_argument(
         "--llama-checkpoint-path",
         type=str,
@@ -850,15 +874,12 @@ app = Kui(
     cors_config={},
 )
 
-
-
 import asyncio
 import threading
 import websockets
 from silero_vad import VADIterator
 SAMPLING_RATE= 16000
 SILENCE_THRESHOLD = 0.2
-from matplotlib import pyplot as plt
 from enum import Enum
 
 # 定义状态枚举
@@ -871,46 +892,65 @@ class StateMachine:
     def __init__(self):
         self.state = State.IDLE  # 初始化为空闲状态
         self.threshold = 0.3
-        self.answer = []
+        self.probs = []
+        self.dbs = []
         self.bytes = bytes()
         self.miss_count = 0  # 计数器：连续未满足阈值的次数
+        self.db_threshold = 60
+    
+    def calculate_db(self, audio_data: np.ndarray) -> float:
+        rms = np.sqrt(np.mean(np.square(audio_data)))
+        reference = 1.0
+        if rms == 0:
+            return -np.inf
+        db = 20 * np.log10(rms / reference)
+        return db
 
-    def process(self, number, chunk_np: np.ndarray):
+    def update(self, chunk_bytes, prob, db):
+        self.probs.append(prob)
+        self.dbs.append(db)
+        self.bytes += chunk_bytes
+
+    def process(self, prob, chunk_np: np.ndarray):
         chunk_bytes = chunk_np.astype(np.int16).tobytes()
+        db = self.calculate_db(chunk_np)
+
         if self.state == State.IDLE:
-            if number < self.threshold:
-                pass
-            else:
+            if prob >= self.threshold and db >= self.db_threshold:
                 self.state = State.ACTIVE
-                self.answer.append(number)
-                self.bytes += chunk_bytes
+                self.update(chunk_bytes, prob, db)
+            else:
+                pass
         elif self.state == State.ACTIVE:
-            if number < self.threshold:
+            self.update(chunk_bytes, prob, db)
+            if prob < self.threshold:
                 self.state = State.INACTIVE
-            self.answer.append(number)
-            self.bytes += chunk_bytes
+            else:
+                pass
+            
         elif self.state == State.INACTIVE:
-            if number >= self.threshold:
+            self.update(chunk_bytes, prob, db)
+            if prob >= self.threshold:
                 self.state = State.ACTIVE
                 self.miss_count = 0  # 重置计数器
-                self.bytes += chunk_bytes
             else:
                 self.miss_count += 1  # 连续未满足阈值，计数器加1
-                self.bytes += chunk_bytes
-                if self.miss_count >= 3:  # 连续3次不满足阈值
+                if self.miss_count >= 24:  # 连续24次不满足阈值 ~ 0.8 s 空音频
                     self.state = State.IDLE
-                    if len(self.answer) > 9:
-                        yield self.answer.copy(), self.bytes
-                    self.answer.clear()
+                    if len(self.probs) > 30: # ~ 1 s
+                        yield self.probs.copy(), self.dbs.copy(), self.bytes
+                    self.probs.clear()
+                    self.dbs.clear()
                     self.bytes = b""
                     self.miss_count = 0  # 重置计数器
-            self.answer.append(number)
 
     def get_result(self, input_num, chunk_np):
         yield from self.process(input_num, chunk_np)
                                 
-# WebSocket处理函数
+
 async def audio_handler(websocket, path):
+
+    window_size_samples = 512 if SAMPLING_RATE == 16000 else 256
 
     async for audio_bytes in websocket:
         # print(f"Received audio data of length: {len(audio_bytes)}")
@@ -919,8 +959,6 @@ async def audio_handler(websocket, path):
         audio_resampled_original = librosa.resample(audio_np_original, orig_sr=44100, target_sr=SAMPLING_RATE)
         audio_resampled = librosa.resample(audio_np, orig_sr=44100, target_sr=SAMPLING_RATE)
         
-        window_size_samples = 512 if SAMPLING_RATE == 16000 else 256
-
         for i in range(0, len(audio_resampled), window_size_samples):
             chunk_np_original = audio_resampled_original[i:i+window_size_samples]
             chunk_np = audio_resampled[i:i+window_size_samples]
@@ -932,10 +970,24 @@ async def audio_handler(websocket, path):
             if speech_prob:
                 # print(f"Speech prob: {speech_prob * 100:.2f}%")
                 iter = state_machine.get_result(speech_prob, chunk_np_original)
-                for it, _bytes in iter:
-                    rounded_it = [round(x, 2) for x in it]
-                    print("len: ", len(rounded_it), ", probs: ", rounded_it, " len: ", len(_bytes))
-                    stream.write(_bytes)
+
+                for prob, dbs, _bytes in iter:
+                    rounded_probs = [round(x, 2) for x in prob]
+                    rounded_dbs = [round(y, 2) for y in dbs]
+                    print("len: ", len(rounded_probs), ", probs: ", rounded_probs, " byte_len: ", len(_bytes))
+                    print("len: ", len(rounded_dbs), ", dbs: ", rounded_dbs)
+                    await audio_queue.put(_bytes)
+                    asr_response_packed = api_invoke_asr(
+                        ServeASRRequest(
+                            audios=[_bytes],
+                            sample_rate=16000,
+                        )
+                    )
+                    asr_response = ormsgpack.unpackb(
+                        asr_response_packed
+                    )
+                    print(asr_response)
+
 
         vad_iterator.reset_states()  # reset model states after each audio
 
@@ -944,72 +996,23 @@ async def start_websocket_server():
     host = "localhost"
     port = 8765
     start_server = websockets.serve(audio_handler, host, port)
-    await start_server
     logger.info(f"WebSocket server started at ws://{host}:{port}")
-    await asyncio.Future()  # run forever until the task is cancelled
+    await start_server # run forever until the task is cancelled
 
-def run_server_in_thread(async_task: Coroutine):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop) 
-    loop.run_until_complete(async_task)
-
-# 用于线程通信的队列
-data_queue = queue.Queue()
-
-# 创建图表函数
-def create_plot():
-
-    fig, ax = plt.subplots(figsize=(10, 6))
-    ax.set_xlim(0, 10)  # 横坐标范围：0-10秒
-    ax.set_ylim(0, 1)  # 纵坐标范围：0到1的概率
-    line, = ax.plot([], [], label="Speech Probability")  # 创建图线
-    ax.set_xlabel("Time (s)")
-    ax.set_ylabel("Speech Probability")
-    ax.legend()
-    
-    return fig, ax, line
-
-# 更新图表函数
-def update_plot(fig: plt.Figure, ax: plt.Axes, line: plt.Line2D, times: list, speech_probs: list):
-    # 更新数据并重新绘制图表
-    line.set_xdata(times)
-    line.set_ydata(speech_probs)
-
-    ax.draw_artist(ax.patch)  # 重绘背景
-    ax.draw_artist(line)  # 只重绘线条部分
-
-    fig.canvas.flush_events()
-    plt.pause(0.01)
-
-
-def plot_graph():
-    # 创建图表
-    fig, ax, line = create_plot()
-
-    plt.ion()
-    fig.canvas.draw()
-
-    times = []  # 时间轴
-    speech_probs = []  # 语音概率
+# Audio playback function (run in a separate thread)
+async def start_playback():
+    p = pyaudio.PyAudio()
+    audio_format = pyaudio.paInt16
+    stream = p.open(format=audio_format, channels=1, rate=SAMPLING_RATE, output=True)
+    logger.info("Playback is running in a separate thread...")
 
     while True:
-        try:
-            current_time, speech_prob = data_queue.get(timeout=1)  # 获取新的数据点
-        except queue.Empty:
-            continue  # 如果队列为空，继续等待
+        audio_bytes = await audio_queue.get()
+        if audio_bytes is None:
+            logger.info("Received None, stop consuming...")
+            break
+        stream.write(audio_bytes)
 
-        # 添加新的数据点
-        times.append(current_time)
-        speech_probs.append(speech_prob)
-
-        # 如果超过10秒，删除最早的点
-        if len(times) > 300:
-            times = times[1:]
-            speech_probs = speech_probs[1:]
-
-        # 更新图表
-        update_plot(fig, ax, line, times, speech_probs)
-    
 # Each worker process created by Uvicorn has its own memory space,
 # meaning that models and variables are not shared between processes.
 # Therefore, any global variables (like `llama_queue` or `decoder_model`)
@@ -1023,7 +1026,7 @@ def plot_graph():
 def initialize_app(app: Kui):
 
     global args, llama_queue, tokenizer, config, decoder_model, vad_model,\
-          asr_model, prompt_tokens, prompt_texts, vad_iterator, state_machine, stream
+          asr_model, prompt_tokens, prompt_texts, vad_iterator, state_machine, audio_queue
    
     prompt_tokens, prompt_texts = [], []
 
@@ -1032,75 +1035,72 @@ def initialize_app(app: Kui):
     args = parse_args()  # args same as ones in other processes
     args.precision = torch.half if args.half else torch.bfloat16
 
-    if args.load_asr_model:
+    if args.load_asr_model or args.fake_chat_mode:
         logger.info(f"Loading ASR model...")
         asr_model = load_asr_model(device=args.device)
 
-    logger.info("Loading Llama model...")
+    if args.load_vad_model or args.fake_chat_mode:
+        vad_model = load_silero_vad()
+        logger.info("VAD model loaded, warming up...")
 
-    if args.mode == "tts":
-        llama_queue = launch_thread_safe_queue(
-            checkpoint_path=args.llama_checkpoint_path,
+    if args.load_listen_module or args.fake_chat_mode:
+        vad_iterator = VADIterator(vad_model, sampling_rate=SAMPLING_RATE)
+        audio_queue = asyncio.Queue()
+        loop = asyncio.get_event_loop()
+        loop.create_task(start_websocket_server())
+        loop.create_task(start_playback())
+
+    if args.load_llama_model:
+        logger.info("Loading Llama model...")
+
+        if args.mode == "tts":
+            llama_queue = launch_thread_safe_queue(
+                checkpoint_path=args.llama_checkpoint_path,
+                device=args.device,
+                precision=args.precision,
+                compile=args.compile,
+            )
+        else:
+            llama_queue, tokenizer, config = launch_thread_safe_queue_agent(
+                checkpoint_path=args.llama_checkpoint_path,
+                device=args.device,
+                precision=args.precision,
+                compile=args.compile,
+            )
+
+        logger.info("Llama model loaded, loading VQ-GAN model...")
+
+    if args.load_decoder_model:
+        decoder_model = load_decoder_model(
+            config_name=args.decoder_config_name,
+            checkpoint_path=args.decoder_checkpoint_path,
             device=args.device,
-            precision=args.precision,
-            compile=args.compile,
-        )
-    else:
-        llama_queue, tokenizer, config = launch_thread_safe_queue_agent(
-            checkpoint_path=args.llama_checkpoint_path,
-            device=args.device,
-            precision=args.precision,
-            compile=args.compile,
         )
 
-    logger.info("Llama model loaded, loading VQ-GAN model...")
-
-    decoder_model = load_decoder_model(
-        config_name=args.decoder_config_name,
-        checkpoint_path=args.decoder_checkpoint_path,
-        device=args.device,
-    )
-
-    logger.info("VQ-GAN model loaded, warming up...")
-
-    vad_model = load_silero_vad()
-
-    logger.info("VAD model loaded, warming up...")
-
-    ws_server_thread = threading.Thread(target=run_server_in_thread, args=[start_websocket_server()], daemon=True)
-    ws_server_thread.start()
-    # plot_thread = threading.Thread(target=plot_graph, daemon=True)
-    # plot_thread.start()
-
-    vad_iterator = VADIterator(vad_model, sampling_rate=SAMPLING_RATE)
-    logger.info("WebSocket server is running in a separate thread...")
+        logger.info("VQ-GAN model loaded, warming up...")
     
-    p = pyaudio.PyAudio()
-    audio_format = pyaudio.paInt16  # Assuming 16-bit PCM format
-    stream = p.open(
-        format=audio_format, channels=1, rate=16000, output=True
-    )
 
-    if args.mode == "tts":
-        # Dry run to ensure models work and avoid first-time latency
-        list(
-            inference(
-                ServeTTSRequest(
-                    text="Hello world.",
-                    references=[],
-                    reference_id=None,
-                    max_new_tokens=0,
-                    chunk_length=200,
-                    top_p=0.7,
-                    repetition_penalty=1.2,
-                    temperature=0.7,
-                    emotion=None,
-                    format="wav",
+    if args.load_llama_model and args.load_decoder_model:
+        if args.mode == "tts":
+            # Dry run to ensure models work and avoid first-time latency
+            list(
+                inference(
+                    ServeTTSRequest(
+                        text="Hello world.",
+                        references=[],
+                        reference_id=None,
+                        max_new_tokens=0,
+                        chunk_length=200,
+                        top_p=0.7,
+                        repetition_penalty=1.2,
+                        temperature=0.7,
+                        emotion=None,
+                        format="wav",
+                    )
                 )
             )
-        )
 
-    logger.info(f"Warming up done, starting server at http://{args.listen}")
+        logger.info(f"Warming up done, starting server at http://{args.listen}")
 
 
 if __name__ == "__main__":
